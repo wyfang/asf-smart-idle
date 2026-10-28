@@ -1,0 +1,49 @@
+name: Build SmartIdle
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build, test, and package
+        run: scripts/build.sh
+        env:
+          OUTPUT_DIR: ${{ github.workspace }}/artifacts
+      - name: Verify loading in the ASF host
+        run: python3 scripts/smoke-test.py
+      - name: Verify the trimmed linux-x64 host
+        env:
+          ASF_SMOKE_EXECUTABLE: ${{ runner.temp }}/asf-linux/ArchiSteamFarm
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, subprocess, urllib.request, zipfile
+          reference = pathlib.Path(subprocess.check_output(['scripts/prepare-asf.sh'], text=True).strip())
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ASF-linux-x64.zip'
+          with urllib.request.urlopen('https://github.com/JustArchiNET/ArchiSteamFarm/releases/download/6.3.10.6/ASF-linux-x64.zip', timeout=60) as response:
+              archive.write_bytes(response.read())
+          expected = next(line.split()[0] for line in (reference.parent / 'SHA512SUMS').read_text().splitlines() if line.rstrip().endswith('ASF-linux-x64.zip'))
+          assert hashlib.sha512(archive.read_bytes()).hexdigest() == expected
+          destination = pathlib.Path(os.environ['RUNNER_TEMP']) / 'asf-linux'
+          with zipfile.ZipFile(archive) as bundle:
+              bundle.extractall(destination)
+          (destination / 'ArchiSteamFarm').chmod(0o755)
+          PY
+          python3 scripts/smoke-test.py
+      - name: Upload installable plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartIdle
+          path: artifacts/SmartIdle.zip
+          if-no-files-found: error

@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <Version>0.2.1</Version>
+    <AsfVersion>6.3.10.6</AsfVersion>
+    <AsfReferenceDir Condition="'$(AsfReferenceDir)' == ''">$(ASF_REFERENCE_DIR)</AsfReferenceDir>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,11 @@
+{
+  "SmartIdle": {
+    "Enabled": true,
+    "ConcurrentGames": 32,
+    "SelectionMode": "LeastPlaytime",
+    "RotationMinutes": 120,
+    "RefreshHours": 0,
+    "PinnedGames": [],
+    "Blacklist": []
+  }
+}

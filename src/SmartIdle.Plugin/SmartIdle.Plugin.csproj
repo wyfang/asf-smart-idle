@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>SmartIdle</AssemblyName>
+    <RootNamespace>SmartIdle</RootNamespace>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../SmartIdle.Core/SmartIdle.Core.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Reference Include="ArchiSteamFarm" HintPath="$(AsfReferenceDir)/ArchiSteamFarm.dll" Private="false" />
+    <Reference Include="SteamKit2" HintPath="$(AsfReferenceDir)/SteamKit2.dll" Private="false" />
+    <Reference Include="protobuf-net" HintPath="$(AsfReferenceDir)/protobuf-net.dll" Private="false" />
+    <Reference Include="protobuf-net.Core" HintPath="$(AsfReferenceDir)/protobuf-net.Core.dll" Private="false" />
+    <Reference Include="System.Composition.AttributedModel" HintPath="$(AsfReferenceDir)/System.Composition.AttributedModel.dll" Private="false" />
+  </ItemGroup>
+  <Target Name="CheckAsfReference" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(AsfReferenceDir)/ArchiSteamFarm.dll')" Text="Missing ASF reference. Run scripts/prepare-asf.sh and set ASF_REFERENCE_DIR to its output." />
+  </Target>
+</Project>
