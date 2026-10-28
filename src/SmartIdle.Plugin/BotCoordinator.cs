@@ -14,6 +14,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
     private readonly SemaphoreSlim Gate = new(1, 1);
     private readonly object SessionLock = new();
     private readonly CancellationTokenSource Stop = new();
+    private readonly PlaybackLifecycle Lifecycle = new();
     private Task? Worker;
     private IdlePlanner? Planner;
     private string? StatePath;
@@ -24,14 +25,18 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
     private volatile bool LibraryVerified;
     private volatile bool HasLibrarySnapshot;
     private volatile bool SessionOwned;
-    private volatile bool Blocked;
     private volatile bool FarmerYield;
-    private volatile bool Reassert = true;
+    private bool NativeConfigInitialized;
+    private bool ConfigReloadPending;
+    private readonly string ConfigPath = Path.GetFullPath(bot.GetFilePath(Bot.EFileType.Config));
     private long InterruptedAt;
     private long ActiveSince;
     private long ConnectionGeneration;
-    private long PlaybackGeneration;
-    private DateTimeOffset ResumeAfter;
+    private long NativeEpoch;
+    private long FarmerEventSequence;
+    private long LastObservedFarmerEvent;
+    private bool LastFarmerPaused = bot.CardsFarmer.Paused;
+    private CancellationTokenSource? ActiveConfigWrite;
     private DateTimeOffset NextScan = DateTimeOffset.MaxValue;
     private DateTimeOffset NextSave;
     private DateTimeOffset LastWarning;
@@ -40,14 +45,21 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
     private bool StartupFarmerPause = bot.BotConfig.FarmingPreferences.HasFlag(BotConfig.EFarmingPreferences.FarmingPausedByDefault);
     private uint[] SentGames = [];
 
-    internal void Start() => Worker = RunAsync();
+    internal void Start() {
+        if (bot.IsConnectedAndLoggedOn) OnConnected();
+        Worker = RunAsync();
+    }
+
     internal void OnConnected() {
         lock (SessionLock) {
             Interlocked.Increment(ref ConnectionGeneration);
             LibraryVerified = HasLibrarySnapshot;
             ForceScan = !HasLibrarySnapshot;
-            Blocked = false;
-            FarmerYield = bot.CardsFarmer.NowFarming;
+            Lifecycle.OnConnected(DateTimeOffset.UtcNow);
+            if (FarmerEventSequence == 0) FarmerYield = !bot.CardsFarmer.Paused;
+            else FarmerYield = FarmerYield || bot.CardsFarmer.NowFarming;
+            LastFarmerPaused = bot.CardsFarmer.Paused;
+            LastObservedFarmerEvent = FarmerEventSequence;
             InvalidateSession();
         }
     }
@@ -55,31 +67,62 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         lock (SessionLock) {
             Interlocked.Increment(ref ConnectionGeneration);
             LibraryVerified = false;
+            Lifecycle.OnDisconnected();
+            FarmerEventSequence = 0;
+            LastObservedFarmerEvent = 0;
             InvalidateSession();
         }
     }
     internal void OnFarmerChanged(bool started) {
         lock (SessionLock) {
+            FarmerEventSequence++;
             FarmerYield = started;
             InvalidateSession();
         }
     }
     internal void OnPlayingBlocked(bool blocked) {
         lock (SessionLock) {
-            if (Blocked == blocked) return;
-            Blocked = blocked;
-            if (!blocked) {
-                ResumeAfter = DateTimeOffset.UtcNow.AddSeconds(Math.Max(5, (int) (ASF.GlobalConfig?.MinFarmingDelayAfterBlock ?? 60)));
-            }
+            if (!Lifecycle.OnPlayingBlocked(blocked, DateTimeOffset.UtcNow, ASF.GlobalConfig?.MinFarmingDelayAfterBlock ?? 60)) return;
             InvalidateSession();
         }
     }
 
+    internal void OnLibraryLockChanged(uint accountId) {
+        lock (SessionLock) {
+            bool blocked = accountId != 0 && accountId != new SteamKit2.SteamID(bot.SteamID).AccountID;
+            if (!Lifecycle.OnLibraryBlocked(blocked, DateTimeOffset.UtcNow, ASF.GlobalConfig?.MinFarmingDelayAfterBlock ?? 60)) return;
+            InvalidateSession();
+        }
+    }
+
+    internal long FarmerEventStamp { get { lock (SessionLock) return FarmerEventSequence; } }
+
+    internal void OnFarmerResumeRequested(long previousStamp) {
+        lock (SessionLock) {
+            if (FarmerEventSequence != previousStamp) return;
+            FarmerYield = true;
+            InvalidateSession();
+        }
+    }
+
+    private void ObserveFarmerPause() {
+        lock (SessionLock) {
+            bool paused = bot.CardsFarmer.Paused;
+            if (LastFarmerPaused && !paused && FarmerEventSequence == LastObservedFarmerEvent) {
+                FarmerYield = true;
+                InvalidateSession();
+            }
+            if (!paused) StartupFarmerPause = false;
+            LastFarmerPaused = paused;
+            LastObservedFarmerEvent = FarmerEventSequence;
+        }
+    }
+
     private void InvalidateSession() {
-        PlaybackGeneration++;
+        NativeEpoch++;
+        ActiveConfigWrite?.Cancel();
         Interlocked.CompareExchange(ref InterruptedAt, Stopwatch.GetTimestamp(), 0);
         SessionOwned = false;
-        Reassert = true;
     }
 
     private async Task RunAsync() {
@@ -89,10 +132,11 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
                 await Gate.WaitAsync(Stop.Token).ConfigureAwait(false);
                 try { await TickAsync().ConfigureAwait(false); }
                 catch (OperationCanceledException) when (Stop.IsCancellationRequested) { break; }
+                catch (OperationCanceledException) { StopTracking(); }
                 catch (Exception exception) {
                     // Do not continue sending after a state/IO failure. Retain the state file for repair.
                     FatalError = exception.Message;
-                    await StopOwnedSessionAsync().ConfigureAwait(false);
+                    StopTracking();
                     bot.ArchiLogger.LogGenericError($"SmartIdle 已停止：{exception.Message}");
                 } finally { Gate.Release(); }
                 await Task.Delay(TimeSpan.FromSeconds(5), Stop.Token).ConfigureAwait(false);
@@ -106,10 +150,10 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         if (!bot.IsConnectedAndLoggedOn) { SessionOwned = false; return; }
         // Preserve ASF's configured startup pause. Once the user resumes the farmer,
         // any later pause is manual and must not be bypassed by the plugin.
-        if (!bot.CardsFarmer.Paused) StartupFarmerPause = false;
+        ObserveFarmerPause();
         if (Planner is null || StateAccount != bot.SteamID) {
             if (Planner is not null) {
-                await StopOwnedSessionAsync().ConfigureAwait(false);
+                StopTracking();
                 await SaveAsync().ConfigureAwait(false);
             }
             ReleaseLease();
@@ -153,8 +197,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
                     Planner.RefreshLibrary(games);
                     HasLibrarySnapshot = true;
                     LibraryVerified = true;
-                    Reassert = true;
-                }
+                            }
                 NextScan = options.RefreshHours == 0 ? DateTimeOffset.MaxValue : DateTimeOffset.UtcNow.AddHours(options.RefreshHours);
                 // Persistence errors are fatal and must not be swallowed as a transient Steam error.
                 await SaveAsync().ConfigureAwait(false);
@@ -162,40 +205,141 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             }
         }
 
+        if (ConfigReloadPending) { StopTracking(); return; }
+        if (Planner.State.Paused) {
+            StopTracking();
+            if (!NativeConfigInitialized || Planner.State.RestoreOriginalOnIdle) {
+                await RestoreNativeConfigurationAsync(Planner.State.RestoreOriginalOnIdle).ConfigureAwait(false);
+            }
+            if (DateTimeOffset.UtcNow >= NextSave) await SaveAsync().ConfigureAwait(false);
+            return;
+        }
         if (!CanPlay()) {
-            await StopOwnedSessionAsync().ConfigureAwait(false);
+            StopTracking();
             if (DateTimeOffset.UtcNow >= NextSave) await SaveAsync().ConfigureAwait(false);
             return;
         }
         var batch = Planner.CurrentOrSelectBatch();
-        if (batch.Count == 0) { await StopOwnedSessionAsync().ConfigureAwait(false); return; }
+        if (batch.Count == 0) {
+            StopTracking();
+            // No approved or pinned games: retain the user's original ASF idle list.
+            await RestoreNativeConfigurationAsync(disablePlugin: false).ConfigureAwait(false);
+            return;
+        }
         if (Planner.State.RemainingRotationSeconds <= 0) {
-            lock (SessionLock) {
-                Accrue();
-                ActiveSince = 0;
-                batch = Planner.Rotate();
-            }
+            StopTracking();
+            batch = Planner.Rotate();
             await SaveAsync().ConfigureAwait(false);
-            Reassert = true;
         }
-        bool needsPlayback;
+        if (!NativeConfigInitialized || !NativeGamesMatch(batch) || !Sequence.Equal(batch, SentGames)) {
+            if (await ApplyNativeBatchAsync(batch).ConfigureAwait(false)) return;
+        }
         lock (SessionLock) {
-            needsPlayback = Reassert || !SessionOwned || !Sequence.Equal(batch, SentGames);
-        }
-        bool sent = needsPlayback && await PlayBatchAsync(batch).ConfigureAwait(false);
-        if (sent) {
-            await SaveAsync().ConfigureAwait(false);
-            bot.ArchiLogger.LogGenericInfo($"SmartIdle 当前挂时长：{string.Join(", ", batch)}。");
+            if (!CanPlay() || !NativeGamesMatch(batch)) return;
+            if (!SessionOwned) {
+                SentGames = new List<uint>(batch).ToArray();
+                Interlocked.Exchange(ref InterruptedAt, 0);
+                SessionOwned = true;
+                ActiveSince = Stopwatch.GetTimestamp();
+            }
         }
         if (DateTimeOffset.UtcNow >= NextSave) await SaveAsync().ConfigureAwait(false);
+    }
+
+    private CancellationTokenSource? BeginConfigWrite(bool requireActive, out long epoch) {
+        lock (SessionLock) {
+            ObserveFarmerPause();
+            epoch = NativeEpoch;
+            if (!(requireActive ? CanPlay() : SafeToReloadConfiguration())) return null;
+            var cancellation = CancellationTokenSource.CreateLinkedTokenSource(Stop.Token);
+            ActiveConfigWrite = cancellation;
+            return cancellation;
+        }
+    }
+
+    private bool CanCommitConfig(CancellationTokenSource cancellation, long epoch, bool requireActive) {
+        lock (SessionLock) {
+            // Resume starts scanning before NowFarming or a farmer event changes.
+            // Re-read Paused at the final commit boundary as well as at each tick.
+            ObserveFarmerPause();
+            return !cancellation.IsCancellationRequested && epoch == NativeEpoch &&
+                (requireActive ? CanPlay() : SafeToReloadConfiguration());
+        }
+    }
+
+    private void EndConfigWrite(CancellationTokenSource cancellation) {
+        lock (SessionLock) {
+            if (ReferenceEquals(ActiveConfigWrite, cancellation)) ActiveConfigWrite = null;
+        }
+        cancellation.Dispose();
+    }
+
+    private async Task<bool> ApplyNativeBatchAsync(IReadOnlyCollection<uint> batch) {
+        var cancellation = BeginConfigWrite(requireActive: true, out long epoch);
+        if (cancellation is null) return false;
+        try {
+            StopTracking();
+            await SaveAsync().ConfigureAwait(false);
+            NativeReloadState.Mark(ConfigPath, bot.CardsFarmer.Paused);
+            bool changed;
+            try {
+                changed = await NativeIdleConfigStore.ApplyAsync(ConfigPath, batch, cancellation.Token,
+                    () => CanCommitConfig(cancellation, epoch, requireActive: true)).ConfigureAwait(false);
+            } catch { NativeReloadState.Cancel(ConfigPath); throw; }
+            NativeConfigInitialized = true;
+            if (changed || !NativeGamesMatch(batch)) {
+                if (!changed) NativeReloadState.Cancel(ConfigPath);
+                ConfigReloadPending = true;
+                bot.ArchiLogger.LogGenericInfo($"SmartIdle 已更新 GamesPlayedWhileIdle：{string.Join(", ", batch)}；等待 ASF 重载此机器人。");
+                return true;
+            }
+            NativeReloadState.Cancel(ConfigPath);
+            return false;
+        } finally { EndConfigWrite(cancellation); }
+    }
+
+    private async Task<bool> RestoreNativeConfigurationAsync(bool disablePlugin) {
+        var cancellation = BeginConfigWrite(requireActive: false, out long epoch);
+        if (cancellation is null) return false;
+        try {
+            NativeReloadState.Mark(ConfigPath, bot.CardsFarmer.Paused);
+            bool changed;
+            try {
+                changed = await NativeIdleConfigStore.RestoreAsync(ConfigPath, disablePlugin, cancellation.Token,
+                    () => CanCommitConfig(cancellation, epoch, requireActive: false)).ConfigureAwait(false);
+            } catch { NativeReloadState.Cancel(ConfigPath); throw; }
+            NativeConfigInitialized = true;
+            if (disablePlugin && Planner is not null && StatePath is not null) {
+                // Clear only after config and backup commit. A canceled request remains
+                // persisted and will be retried after the next safe idle transition.
+                Planner.State.RestoreOriginalOnIdle = false;
+                await IdleStateStore.SaveAsync(StatePath, Planner.State).ConfigureAwait(false);
+            }
+            if (!changed) NativeReloadState.Cancel(ConfigPath);
+            else {
+                ConfigReloadPending = true;
+                bot.ArchiLogger.LogGenericInfo("SmartIdle 已还原原始 GamesPlayedWhileIdle；等待 ASF 重载此机器人。");
+            }
+            return changed;
+        } finally { EndConfigWrite(cancellation); }
     }
 
     private bool CanPlay() {
         lock (SessionLock) {
             return !Stop.IsCancellationRequested && FatalError is null && Planner is not null && !Planner.State.Paused && LibraryVerified &&
-                bot.IsConnectedAndLoggedOn && bot.IsPlayingPossible && !Blocked && !FarmerYield &&
-                !bot.CardsFarmer.NowFarming && (!bot.CardsFarmer.Paused || StartupFarmerPause) && DateTimeOffset.UtcNow >= ResumeAfter;
+                SafeToReloadConfiguration() && (!bot.CardsFarmer.Paused || StartupFarmerPause);
         }
+    }
+
+    private bool SafeToReloadConfiguration() {
+        lock (SessionLock) {
+            return bot.IsConnectedAndLoggedOn && bot.IsPlayingPossible && Lifecycle.CanPlay(DateTimeOffset.UtcNow) &&
+                !FarmerYield && !bot.CardsFarmer.NowFarming && !Stop.IsCancellationRequested;
+        }
+    }
+
+    private bool NativeGamesMatch(IReadOnlyCollection<uint> games) {
+        return new HashSet<uint>(games).SetEquals(bot.BotConfig.GamesPlayedWhileIdle);
     }
 
     private void Accrue() {
@@ -210,81 +354,11 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         }
     }
 
-    private async Task<bool> PlayBatchAsync(IReadOnlyCollection<uint> batch) {
-        string? customName = bot.BotConfig.CustomGamePlayedWhileIdle;
-        SteamSession? session = null;
-        long generation = 0;
-        return await PlaybackTransition.ApplyAsync(customName, () => {
-            lock (SessionLock) {
-                if (!CanPlay() || (session = getSession()) is null) return false;
-                Accrue();
-                generation = PlaybackGeneration;
-                Reassert = true;
-                if (!string.IsNullOrEmpty(customName)) {
-                    if (!session.SendGames([])) return false;
-                    // We still own this cleared session, so disposal can restore ASF's list.
-                    // No game receives locally estimated time during the reset gap.
-                    ActiveSince = 0;
-                    SessionOwned = true;
-                }
-                return true;
-            }
-        }, () => {
-            lock (SessionLock) {
-                // Callbacks never await Gate. A disconnect, farmer or block event during
-                // the delay invalidates this transition, even if it clears again quickly.
-                if (generation != PlaybackGeneration || !ReferenceEquals(session, getSession()) || !CanPlay()) return false;
-                if (session?.SendGames(batch, customName) != true) return false;
-                SentGames = new List<uint>(batch).ToArray();
-                Interlocked.Exchange(ref InterruptedAt, 0);
-                Reassert = false;
-                SessionOwned = true;
-                ActiveSince = Stopwatch.GetTimestamp();
-                return true;
-            }
-        }, Stop.Token).ConfigureAwait(false);
-    }
-
-    private bool CanRestoreIdle() => bot.IsConnectedAndLoggedOn && bot.IsPlayingPossible && !Blocked &&
-        !bot.CardsFarmer.NowFarming && !FarmerYield && (!bot.CardsFarmer.Paused || StartupFarmerPause);
-
-    private async Task StopOwnedSessionAsync() {
-        SteamSession? session;
-        long generation;
-        var fallback = new List<uint>();
-        string? customName = bot.BotConfig.CustomGamePlayedWhileIdle;
+    private void StopTracking() {
         lock (SessionLock) {
             Accrue();
-            // Sending an empty list must never stop a farmer or a human-controlled Steam session.
-            // Native ASF pause and play both set CardsFarmer.Paused. They cannot be distinguished
-            // here; relinquish control without clearing a potentially manual play list. To stop
-            // plugin games deterministically, use SIDLE PAUSE before native pause/play commands.
-            session = SessionOwned && CanRestoreIdle() ? getSession() : null;
-            generation = ++PlaybackGeneration;
             SessionOwned = false;
             ActiveSince = 0;
-            Reassert = true;
-            if (session is null) return;
-            int capacity = PlaylistCapacity.GameSlots(32, customName);
-            foreach (uint id in bot.BotConfig.GamesPlayedWhileIdle) {
-                if (fallback.Count >= capacity) break;
-                fallback.Add(id);
-            }
-        }
-        try {
-            await PlaybackTransition.ApplyAsync(customName, () => {
-                lock (SessionLock) {
-                    if (generation != PlaybackGeneration || !ReferenceEquals(session, getSession()) || !CanRestoreIdle()) return false;
-                    return string.IsNullOrEmpty(customName) || session.SendGames([]);
-                }
-            }, () => {
-                lock (SessionLock) {
-                    if (generation != PlaybackGeneration || !ReferenceEquals(session, getSession()) || !CanRestoreIdle()) return false;
-                    return session.SendGames(fallback, customName);
-                }
-            }).ConfigureAwait(false);
-        } catch (Exception exception) {
-            bot.ArchiLogger.LogGenericWarning($"SmartIdle 停止播放请求失败：{exception.Message}");
         }
     }
 
@@ -295,6 +369,14 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
     }
 
     internal async Task<string?> CommandAsync(string[] args) {
+        // Diagnostics must not hold Gate while recording: the scheduler and native ASF
+        // continue to run so this observes actual outgoing requests from both writers.
+        if (Sequence.Argument(args, 1)?.Equals("TRACE", StringComparison.OrdinalIgnoreCase) == true) {
+            try {
+                return getSession() is { } session ? await session.TracePlaybackAsync(CancellationToken.None).ConfigureAwait(false) : "SmartIdle：Steam 会话未就绪。";
+            } catch (OperationCanceledException) { return "SmartIdle：诊断因模块重载或关闭而结束。"; }
+            catch (Exception exception) { return $"SmartIdle：诊断失败：{exception.Message}"; }
+        }
         await Gate.WaitAsync().ConfigureAwait(false);
         try {
             if (Stop.IsCancellationRequested) return "SmartIdle：此机器人模块已关闭或重载，请重新执行命令。";
@@ -339,38 +421,42 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
                 case "EXCLUDE": Planner.Exclude(ParseIds(args)); response = "已加入禁止名单。"; save = true; break;
                 case "UNEXCLUDE": Planner.Unexclude(ParseIds(args)); response = "已移出运行时禁止名单；符合条件的游戏进入待加入。配置 Blacklist 仍然有效。"; save = true; break;
                 case "PAUSE":
-                    state.Paused = true; await StopOwnedSessionAsync().ConfigureAwait(false);
-                    response = "插件已暂停，重启后仍保持暂停；已交还 ASF 原有空闲播放设置，不能用此命令停止原有挂机列表。";
+                    state.Paused = true; StopTracking();
+                    response = "插件已暂停；将在安全空闲时还原原始名单，ASF 会重载此机器人；挂卡中则等待挂卡结束。";
                     save = true; break;
-                case "RESUME": state.Paused = false; response = "插件已恢复；仍遵守挂卡、ASF 手动暂停和本人游玩的优先级。"; save = true; break;
+                case "RESTORE":
+                    state.Paused = true; state.RestoreOriginalOnIdle = true; StopTracking();
+                    response = "已安排还原原始名单并禁用 SmartIdle；挂卡中则等待挂卡结束，完成后可卸载插件。"; save = true; break;
+                case "RESUME": state.Paused = false; state.RestoreOriginalOnIdle = false; response = "插件已恢复；仍遵守挂卡、ASF 手动暂停和本人游玩的优先级。"; save = true; break;
                 case "ROTATE":
                     lock (SessionLock) { ActiveSince = 0; Planner.Rotate(); }
                     response = "已选择下一批；常驻游戏保留，等待可运行时播放。"; save = true; break;
                 default: return "SmartIdle：未知命令。" + Help;
             }
             if (save) {
-                Reassert = true;
+                NativeConfigInitialized = false;
                 await SaveAsync().ConfigureAwait(false);
             }
             return "SmartIdle：" + response;
         } catch (ArgumentException exception) { return "SmartIdle：" + exception.Message; }
         catch (Exception exception) {
             FatalError = exception.Message;
-            await StopOwnedSessionAsync().ConfigureAwait(false);
+            StopTracking();
             return $"SmartIdle 已停止：{exception.Message}；请检查状态文件写入权限及日志。";
         } finally { Gate.Release(); }
     }
 
     private string DescribeStatus() {
         lock (SessionLock) {
-            if (Planner!.State.Paused) return "插件已暂停";
+            if (ConfigReloadPending) return "等待 ASF 重载配置（此机器人会短暂重连）";
+            if (Planner!.State.Paused) return Planner.State.RestoreOriginalOnIdle ? "等待还原原名单并禁用插件" : "插件已暂停";
             if (!bot.IsConnectedAndLoggedOn) return "Steam 未连接";
             if (!LibraryVerified) return "等待游戏库校验";
-            if (!bot.IsPlayingPossible || Blocked) return "本人游玩或游戏库被占用";
+            if (!bot.IsPlayingPossible || Lifecycle.PlayingBlocked || Lifecycle.LibraryBlocked) return "本人游玩或游戏库被占用";
             if (bot.CardsFarmer.Paused && !StartupFarmerPause) return "ASF 已暂停或手动播放；插件停止接管";
             if (bot.CardsFarmer.NowFarming || FarmerYield) return "挂卡优先，等待挂卡结束";
-            if (DateTimeOffset.UtcNow < ResumeAfter) return "等待游玩结束后的冷却";
-            return SessionOwned ? "正在挂时长" : "等待调度";
+            if (!Lifecycle.CanPlay(DateTimeOffset.UtcNow)) return "等待游玩结束后的冷却";
+            return SessionOwned ? "ASF 原生空闲清单已配置，正在挂时长" : "等待配置同步";
         }
     }
 
@@ -391,7 +477,9 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         sorted.Sort();
         int pages = Math.Max(1, (sorted.Count + 9) / 10);
         int start = Math.Min(sorted.Count, (page - 1) * 10);
-        return $"{category?.ToUpperInvariant() ?? "PENDING"}，共 {sorted.Count} 款，第 {page}/{pages} 页\n" + FormatGames(sorted.GetRange(start, Math.Min(10, sorted.Count - start)));
+        var pageIds = new List<uint>();
+        for (int index = start; index < Math.Min(sorted.Count, start + 10); index++) pageIds.Add(sorted[index]);
+        return $"{category?.ToUpperInvariant() ?? "PENDING"}，共 {sorted.Count} 款，第 {page}/{pages} 页\n" + FormatGames(pageIds);
     }
 
     private HashSet<uint> ExcludedIds() {
@@ -405,7 +493,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         foreach (uint id in ids) {
             string name = Planner!.State.Library.TryGetValue(id, out var game) ? game.Name.Replace('\r', ' ').Replace('\n', ' ') : "未知游戏";
             if (name.Length > 60) name = name[..60];
-            lines.Add($"{id} · {name} · {game?.PlaytimeMinutes ?? 0} 分钟 · {Planner.Explain(id)}");
+            lines.Add($"{id} · {name} · Steam 快照 {game?.PlaytimeMinutes ?? 0} 分钟 · 排序估算 {Planner.EffectivePlaytimeMinutes(id):F1} 分钟 · {Planner.Explain(id)}");
         }
         return string.Join('\n', lines);
     }
@@ -421,7 +509,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         return Sequence.Distinct(ids);
     }
 
-    internal const string Help = "\nSIDLE STATUS | SCAN | PREVIEW\nSIDLE LIST <PENDING|APPROVED|PINNED|EXCLUDED|REJECTED|ALL> [页码]\nSIDLE APPROVE <ALL|AppID...>\nSIDLE REJECT|PIN|UNPIN|EXCLUDE|UNEXCLUDE|WHY <AppID...>\nSIDLE PAUSE | RESUME | ROTATE";
+    internal const string Help = "\nSIDLE STATUS | SCAN | PREVIEW | TRACE\nSIDLE LIST <PENDING|APPROVED|PINNED|EXCLUDED|REJECTED|ALL> [页码]\nSIDLE APPROVE <ALL|AppID...>\nSIDLE REJECT|PIN|UNPIN|EXCLUDE|UNEXCLUDE|WHY <AppID...>\nSIDLE PAUSE | RESUME | ROTATE | RESTORE";
 
     private void ReleaseLease() {
         if (LeasePath is { } path) {
@@ -436,7 +524,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             if (Worker is not null) await Worker.ConfigureAwait(false);
             await Gate.WaitAsync().ConfigureAwait(false);
             try {
-                await StopOwnedSessionAsync().ConfigureAwait(false);
+                StopTracking();
                 if (Planner is not null && StatePath is not null && FatalError is null) await IdleStateStore.SaveAsync(StatePath, Planner.State).ConfigureAwait(false);
             } catch (Exception exception) { bot.ArchiLogger.LogGenericError($"SmartIdle 退出保存失败：{exception.Message}"); }
             finally { Gate.Release(); }

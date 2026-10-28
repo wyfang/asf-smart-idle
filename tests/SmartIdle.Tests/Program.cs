@@ -6,98 +6,319 @@ using SmartIdle.Core;
 int passed = 0;
 int failed = 0;
 var tests = new (string Name, Func<Task> Run)[] {
-    ("自定义状态先清空，等待官方 500 毫秒，再提交游戏列表", async () => {
-        var events = new List<string>();
-        using var cancellation = new CancellationTokenSource();
-        bool result = await PlaybackTransition.ApplyAsync("WYFANG.NET", () => {
-            events.Add("prepare");
-            return true;
-        }, () => {
-            events.Add("commit");
-            return true;
-        }, cancellation.Token, (duration, token) => {
-            Equal(TimeSpan.FromMilliseconds(500), duration);
-            Equal(cancellation.Token, token);
-            Equal("prepare", string.Join(',', events));
-            events.Add("delay");
-            return Task.CompletedTask;
+    ("播放权限在提交前失效时取消应用，保留当前配置和原名单恢复能力", async () => {
+        await WithTemporaryDirectory(async directory => {
+            foreach (bool alreadyManaged in new[] { false, true }) {
+                string path = Path.Combine(directory, alreadyManaged ? "ManagedGuard.json" : "FirstGuard.json");
+                var original = NativeConfig([10, 730]);
+                await File.WriteAllTextAsync(path, original.ToJsonString());
+                if (alreadyManaged) await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+                string before = await File.ReadAllTextAsync(path);
+                int permissionChecks = 0;
+                await ThrowsAsync<OperationCanceledException>(() => NativeIdleConfigStore.ApplyAsync(path, new uint[] { 440 }, canCommit: () => {
+                    permissionChecks++;
+                    return false;
+                }));
+                True(permissionChecks > 0);
+                Equal(before, await File.ReadAllTextAsync(path));
+                if (alreadyManaged) {
+                    // The failed replacement must not corrupt LastAppliedGames: an
+                    // immediate restore must still recognize the successful old batch.
+                    await NativeIdleConfigStore.RestoreAsync(path, canCommit: () => true);
+                    True(JsonNode.DeepEquals(original, await ReadObject(path)));
+                }
+                await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 400, 620 }, canCommit: () => true);
+                await NativeIdleConfigStore.RestoreAsync(path, canCommit: () => true);
+                True(JsonNode.DeepEquals(original, await ReadObject(path)));
+            }
         });
-        True(result);
-        Equal("prepare,delay,commit", string.Join(',', events));
     }),
-    ("未设置自定义状态时直接提交，无清空等待", async () => {
-        foreach (string? customName in new string?[] { null, "" }) {
-            var events = new List<string>();
-            bool result = await PlaybackTransition.ApplyAsync(customName, () => {
-                events.Add("prepare");
-                return true;
-            }, () => {
-                events.Add("commit");
-                return true;
-            }, delay: (_, _) => throw new InvalidOperationException("普通播放不应等待。"));
-            True(result);
-            Equal("prepare,commit", string.Join(',', events));
-        }
+    ("还原提交权限失效时保留配置和托管备份，权限恢复后可完成还原禁用", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "RestoreGuard.json");
+            var expected = NativeConfig([10, 730]);
+            await File.WriteAllTextAsync(path, expected.ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570, 440 });
+            string applied = await File.ReadAllTextAsync(path);
+            string backupPath = NativeIdleConfigStore.BackupPath(path);
+            string backup = await File.ReadAllTextAsync(backupPath);
+            int permissionChecks = 0;
+            await ThrowsAsync<OperationCanceledException>(() => NativeIdleConfigStore.RestoreAsync(path, disablePlugin: true, canCommit: () => {
+                permissionChecks++;
+                return false;
+            }));
+            True(permissionChecks > 0);
+            Equal(applied, await File.ReadAllTextAsync(path));
+            Equal(backup, await File.ReadAllTextAsync(backupPath));
+            expected["SmartIdle"]!["Enabled"] = false;
+            await NativeIdleConfigStore.RestoreAsync(path, disablePlugin: true, canCommit: () => true);
+            True(JsonNode.DeepEquals(expected, await ReadObject(path)));
+        });
     }),
-    ("准备阶段拒绝接管时不等待也不发送游戏列表", async () => {
-        bool result = await PlaybackTransition.ApplyAsync("WYFANG.NET", () => false,
-            () => throw new InvalidOperationException("准备失败后不应提交。"),
-            delay: (_, _) => throw new InvalidOperationException("准备失败后不应等待。"));
-        True(!result);
+    ("待空闲还原请求可跨重启保存，旧状态无此字段时不误触发", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "state.json");
+            var state = new IdleState { Paused = true, RestoreOriginalOnIdle = true };
+            await IdleStateStore.SaveAsync(path, state);
+            True((await IdleStateStore.LoadAsync(path)).RestoreOriginalOnIdle);
+            var old = JsonNode.Parse(await File.ReadAllTextAsync(path))!.AsObject();
+            old.Remove("RestoreOriginalOnIdle");
+            await File.WriteAllTextAsync(path, old.ToJsonString());
+            True(!(await IdleStateStore.LoadAsync(path)).RestoreOriginalOnIdle);
+            Throws<InvalidDataException>(() => new IdleState { RestoreOriginalOnIdle = true }.Validate());
+        });
     }),
-    ("重载取消发生在清空等待中时不得提交旧列表", async () => {
-        using var cancellation = new CancellationTokenSource();
-        bool prepared = false;
-        bool committed = false;
-        await ThrowsAsync<OperationCanceledException>(() => PlaybackTransition.ApplyAsync("WYFANG.NET", () => {
-            prepared = true;
-            return true;
-        }, () => {
-            committed = true;
-            return true;
-        }, cancellation.Token, (_, _) => {
+    ("原生配置模式只改游戏名单，保留文案、挂卡偏好、凭据及未知字段", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "BotName.json");
+            var original = NativeConfig([10, 730]);
+            await File.WriteAllTextAsync(path, original.ToJsonString());
+            True(await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570, 440 }));
+            var changed = await ReadObject(path);
+            Sequence([570, 440], ReadGames(changed));
+            changed.Remove("GamesPlayedWhileIdle");
+            original.Remove("GamesPlayedWhileIdle");
+            True(JsonNode.DeepEquals(original, changed));
+            True(await NativeIdleConfigStore.MatchesAsync(path, new uint[] { 570, 440 }));
+            True(!await NativeIdleConfigStore.MatchesAsync(path, new uint[] { 10, 730 }));
+        });
+    }),
+    ("重复应用相同名单不写配置，不制造额外重连触发", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Same.json");
+            await File.WriteAllTextAsync(path, NativeConfig([10]).ToJsonString());
+            True(await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570, 440 }));
+            string applied = await File.ReadAllTextAsync(path);
+            DateTime sentinel = new(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            File.SetLastWriteTimeUtc(path, sentinel);
+            True(!await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570, 440 }));
+            Equal(applied, await File.ReadAllTextAsync(path));
+            Equal(sentinel, File.GetLastWriteTimeUtc(path));
+        });
+    }),
+    ("多次换批后还原首次原名单，不把上一批当作原设置", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "BotName.json");
+            var original = NativeConfig([10, 730]);
+            await File.WriteAllTextAsync(path, original.ToJsonString());
+            Equal(Path.Combine(directory, "SmartIdle-native", "BotName.json"), NativeIdleConfigStore.BackupPath(path));
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570, 440 });
+            True(File.Exists(NativeIdleConfigStore.BackupPath(path)));
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 400, 620 });
+            await NativeIdleConfigStore.RestoreAsync(path);
+            True(JsonNode.DeepEquals(original, await ReadObject(path)));
+        });
+    }),
+    ("原配置没有游戏字段时还原会移除字段，保留其他设置", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Absent.json");
+            var original = NativeConfig([10]);
+            original.Remove("GamesPlayedWhileIdle");
+            await File.WriteAllTextAsync(path, original.ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            True((await ReadObject(path)).ContainsKey("GamesPlayedWhileIdle"));
+            await NativeIdleConfigStore.RestoreAsync(path);
+            var restored = await ReadObject(path);
+            True(!restored.ContainsKey("GamesPlayedWhileIdle"));
+            True(JsonNode.DeepEquals(original, restored));
+        });
+    }),
+    ("原配置显式空游戏数组时还原仍保留空数组", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Empty.json");
+            var original = NativeConfig([]);
+            await File.WriteAllTextAsync(path, original.ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            await NativeIdleConfigStore.RestoreAsync(path);
+            var restored = await ReadObject(path);
+            True(restored.ContainsKey("GamesPlayedWhileIdle"));
+            Equal(0, ReadGames(restored).Length);
+            True(JsonNode.DeepEquals(original, restored));
+        });
+    }),
+    ("取消配置写入和还原不覆盖原文件或已有备份", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Cancelled.json");
+            string original = NativeConfig([10]).ToJsonString();
+            await File.WriteAllTextAsync(path, original);
+            using var cancellation = new CancellationTokenSource();
             cancellation.Cancel();
-            // A timer completion can race with cancellation. ApplyAsync must recheck
-            // the token even when the injected wait completes successfully.
-            return Task.CompletedTask;
-        }));
-        True(prepared);
-        True(!committed);
-    }),
-    ("等待中会话发生变化再恢复时仍拒绝旧发送", async () => {
-        long generation = 1;
-        long expected = 0;
-        bool sent = false;
-        bool result = await PlaybackTransition.ApplyAsync("WYFANG.NET", () => {
-            expected = generation;
-            return true;
-        }, () => {
-            if (generation != expected) return false;
-            sent = true;
-            return true;
-        }, delay: (_, _) => {
-            // A farming/connection lifecycle can start and finish inside the gap.
-            // The final permission may be true, but the previous epoch is stale.
-            generation += 2;
-            return Task.CompletedTask;
+            await ThrowsAsync<OperationCanceledException>(() => NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 }, cancellation.Token));
+            Equal(original, await File.ReadAllTextAsync(path));
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            string applied = await File.ReadAllTextAsync(path);
+            string backupPath = NativeIdleConfigStore.BackupPath(path);
+            string backup = await File.ReadAllTextAsync(backupPath);
+            await ThrowsAsync<OperationCanceledException>(() => NativeIdleConfigStore.ApplyAsync(path, new uint[] { 440 }, cancellation.Token));
+            await ThrowsAsync<OperationCanceledException>(() => NativeIdleConfigStore.RestoreAsync(path, false, cancellation.Token));
+            Equal(applied, await File.ReadAllTextAsync(path));
+            Equal(backup, await File.ReadAllTextAsync(backupPath));
         });
-        True(!result);
-        True(!sent);
     }),
-    ("等待期间本人开始游玩时提交阶段重新检查权限", async () => {
-        bool canPlay = true;
-        bool sent = false;
-        bool result = await PlaybackTransition.ApplyAsync("WYFANG.NET", () => canPlay, () => {
-            if (!canPlay) return false;
-            sent = true;
-            return true;
-        }, delay: (_, _) => {
-            canPlay = false;
-            return Task.CompletedTask;
+    ("损坏原名单备份时拒绝还原并保留当前配置原字节", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Corrupt.json");
+            await File.WriteAllTextAsync(path, NativeConfig([10]).ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            string applied = await File.ReadAllTextAsync(path);
+            string backupPath = NativeIdleConfigStore.BackupPath(path);
+            await File.WriteAllTextAsync(backupPath, "{broken backup");
+            await ThrowsAsync<InvalidDataException>(() => NativeIdleConfigStore.RestoreAsync(path));
+            Equal(applied, await File.ReadAllTextAsync(path));
+            Equal("{broken backup", await File.ReadAllTextAsync(backupPath));
         });
-        True(!result);
-        True(!sent);
     }),
+    ("用户已另行修改原生游戏名单时还原不覆盖其新名单", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "External.json");
+            await File.WriteAllTextAsync(path, NativeConfig([10]).ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            var external = await ReadObject(path);
+            external["GamesPlayedWhileIdle"] = new JsonArray(999U, 1000U);
+            string edited = external.ToJsonString();
+            await File.WriteAllTextAsync(path, edited);
+            await NativeIdleConfigStore.RestoreAsync(path);
+            Equal(edited, await File.ReadAllTextAsync(path));
+            // A later restore must not reuse a relinquished claim to overwrite the edit.
+            await NativeIdleConfigStore.RestoreAsync(path);
+            Equal(edited, await File.ReadAllTextAsync(path));
+        });
+    }),
+    ("还原并禁用只额外修改 SmartIdle.Enabled，保留其他插件配置", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Disable.json");
+            var expected = NativeConfig([10, 730]);
+            await File.WriteAllTextAsync(path, expected.ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            expected["SmartIdle"]!["Enabled"] = false;
+            await NativeIdleConfigStore.RestoreAsync(path, disablePlugin: true);
+            True(JsonNode.DeepEquals(expected, await ReadObject(path)));
+        });
+    }),
+    ("还原时合并保留接管期间用户修改的其他配置字段", async () => {
+        await WithTemporaryDirectory(async directory => {
+            string path = Path.Combine(directory, "Merge.json");
+            await File.WriteAllTextAsync(path, NativeConfig([10, 730]).ToJsonString());
+            await NativeIdleConfigStore.ApplyAsync(path, new uint[] { 570 });
+            var changed = await ReadObject(path);
+            changed["CustomGamePlayedWhileIdle"] = "USER NEW TEXT";
+            changed["FarmingPreferences"] = 17;
+            changed["UserNewField"] = new JsonObject { ["nested"] = "保留" };
+            await File.WriteAllTextAsync(path, changed.ToJsonString());
+            changed["GamesPlayedWhileIdle"] = new JsonArray(10U, 730U);
+            await NativeIdleConfigStore.RestoreAsync(path);
+            True(JsonNode.DeepEquals(changed, await ReadObject(path)));
+        });
+    }),
+    ("登录完成即可接管，不添加固定的原生恢复等待", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        True(!lifecycle.CanPlay(now.AddDays(1)));
+        lifecycle.OnConnected(now);
+        True(lifecycle.Connected);
+        Equal(now, lifecycle.ReadyAfter);
+        True(lifecycle.CanPlay(now));
+        True(lifecycle.CanPlay(now.AddMilliseconds(1)));
+    })),
+    ("游戏解锁只等待配置的占用冷却，到期即可接管", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        lifecycle.OnConnected(now);
+        True(lifecycle.OnPlayingBlocked(true, now.AddSeconds(10), 60));
+        True(lifecycle.PlayingBlocked);
+        True(!lifecycle.CanPlay(now.AddHours(1)));
+        True(lifecycle.OnPlayingBlocked(false, now.AddSeconds(20), 60));
+        Equal(now.AddSeconds(80), lifecycle.ReadyAfter);
+        True(!lifecycle.CanPlay(now.AddSeconds(79.999)));
+        True(lifecycle.CanPlay(now.AddSeconds(80)));
+    })),
+    ("共享库与本人游玩分别阻塞，解除一种不能解除另一种", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        lifecycle.OnConnected(now);
+        True(lifecycle.OnPlayingBlocked(true, now.AddSeconds(5), 5));
+        True(lifecycle.OnLibraryBlocked(true, now.AddSeconds(6), 5));
+        True(lifecycle.OnPlayingBlocked(false, now.AddSeconds(10), 5));
+        True(!lifecycle.PlayingBlocked && lifecycle.LibraryBlocked);
+        True(!lifecycle.CanPlay(now.AddHours(1)));
+        True(lifecycle.OnLibraryBlocked(false, now.AddSeconds(20), 5));
+        True(!lifecycle.LibraryBlocked);
+        True(!lifecycle.CanPlay(now.AddSeconds(24.999)));
+        True(lifecycle.CanPlay(now.AddSeconds(25)));
+    })),
+    ("重叠的解锁回调保留较晚期限，不缩短既有冷却", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        lifecycle.OnConnected(now);
+        lifecycle.OnPlayingBlocked(true, now.AddSeconds(4), 60);
+        lifecycle.OnLibraryBlocked(true, now.AddSeconds(5), 5);
+        lifecycle.OnPlayingBlocked(false, now.AddSeconds(10), 60);
+        lifecycle.OnLibraryBlocked(false, now.AddSeconds(11), 5);
+        Equal(now.AddSeconds(70), lifecycle.ReadyAfter);
+        True(!lifecycle.CanPlay(now.AddSeconds(69.999)));
+        True(lifecycle.CanPlay(now.AddSeconds(70)));
+        lifecycle.OnLibraryBlocked(true, now.AddSeconds(71), 60);
+        lifecycle.OnLibraryBlocked(false, now.AddSeconds(72), 60);
+        Equal(now.AddSeconds(132), lifecycle.ReadyAfter);
+    })),
+    ("重复占用通知不延长冷却，低配置值只保留 5 秒下限", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        lifecycle.OnConnected(now);
+        True(!lifecycle.OnPlayingBlocked(false, now.AddSeconds(4), 60));
+        True(!lifecycle.OnLibraryBlocked(false, now.AddSeconds(4), 60));
+        Equal(now, lifecycle.ReadyAfter);
+        True(lifecycle.OnPlayingBlocked(true, now.AddSeconds(5), 0));
+        True(!lifecycle.OnPlayingBlocked(true, now.AddSeconds(6), 60));
+        True(lifecycle.OnPlayingBlocked(false, now.AddSeconds(7), 0));
+        Equal(now.AddSeconds(12), lifecycle.ReadyAfter);
+        True(!lifecycle.OnPlayingBlocked(false, now.AddSeconds(8), 60));
+        Equal(now.AddSeconds(12), lifecycle.ReadyAfter);
+        lifecycle.OnLibraryBlocked(true, now.AddSeconds(13), -20);
+        True(!lifecycle.OnLibraryBlocked(true, now.AddSeconds(14), 60));
+        lifecycle.OnLibraryBlocked(false, now.AddSeconds(15), -20);
+        True(!lifecycle.OnLibraryBlocked(false, now.AddSeconds(16), 60));
+        Equal(now.AddSeconds(20), lifecycle.ReadyAfter);
+        True(!lifecycle.CanPlay(now.AddSeconds(19.999)));
+        True(lifecycle.CanPlay(now.AddSeconds(20)));
+    })),
+    ("断线立即禁止播放，重连清除旧会话占用与冷却", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var lifecycle = new PlaybackLifecycle();
+        lifecycle.OnConnected(now);
+        lifecycle.OnPlayingBlocked(true, now.AddSeconds(4), 60);
+        lifecycle.OnPlayingBlocked(false, now.AddSeconds(5), 60);
+        lifecycle.OnLibraryBlocked(true, now.AddSeconds(6), 60);
+        lifecycle.OnDisconnected();
+        True(!lifecycle.Connected);
+        True(!lifecycle.CanPlay(now.AddDays(1)));
+        lifecycle.OnConnected(now.AddSeconds(10));
+        True(!lifecycle.PlayingBlocked && !lifecycle.LibraryBlocked);
+        Equal(now.AddSeconds(10), lifecycle.ReadyAfter);
+        True(lifecycle.CanPlay(now.AddSeconds(10)));
+        lifecycle.OnDisconnected();
+        True(!lifecycle.CanPlay(now.AddSeconds(11)));
+    })),
+    ("同时解锁的通知顺序不影响完整占用冷却", () => Sync(() => {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        foreach (bool playingFirst in new[] { true, false }) {
+            var lifecycle = new PlaybackLifecycle();
+            lifecycle.OnConnected(now);
+            lifecycle.OnPlayingBlocked(true, now.AddSeconds(1), 60);
+            lifecycle.OnLibraryBlocked(true, now.AddSeconds(2), 5);
+            if (playingFirst) {
+                lifecycle.OnPlayingBlocked(false, now.AddSeconds(10), 60);
+                lifecycle.OnLibraryBlocked(false, now.AddSeconds(10), 5);
+            } else {
+                lifecycle.OnLibraryBlocked(false, now.AddSeconds(10), 5);
+                lifecycle.OnPlayingBlocked(false, now.AddSeconds(10), 60);
+            }
+            Equal(now.AddSeconds(70), lifecycle.ReadyAfter);
+            True(!lifecycle.PlayingBlocked && !lifecycle.LibraryBlocked);
+            True(!lifecycle.CanPlay(now.AddSeconds(69.999)));
+            True(lifecycle.CanPlay(now.AddSeconds(70)));
+        }
+    })),
     ("自定义状态占一个位置，保留 31 个游戏和常驻，始终不超过 32", () => Sync(() => {
         Equal(32, PlaylistCapacity.GameSlots(32, null));
         Equal(32, PlaylistCapacity.GameSlots(32, ""));
@@ -509,7 +730,7 @@ var tests = new (string Name, Func<Task> Run)[] {
             }
         });
     }),
-    ("缺少任何持久字段都拒绝加载并保留原文件", async () => {
+    ("缺少任何必需持久字段都拒绝加载并保留原文件", async () => {
         await WithTemporaryDirectory(async directory => {
             string path = Path.Combine(directory, "bot.json");
             var planner = Create();
@@ -517,7 +738,7 @@ var tests = new (string Name, Func<Task> Run)[] {
             planner.Approve([1]);
             string complete = JsonSerializer.Serialize(planner.State);
             foreach (string field in JsonNode.Parse(complete)!.AsObject().Select(pair => pair.Key).ToArray()) {
-                if (field is "EstimatedPlaytimeMinutes" or "LastSelectionMode") continue;
+                if (field is "EstimatedPlaytimeMinutes" or "LastSelectionMode" or "RestoreOriginalOnIdle") continue;
                 var incomplete = JsonNode.Parse(complete)!.AsObject();
                 incomplete.Remove(field);
                 string original = incomplete.ToJsonString();
@@ -631,3 +852,16 @@ static async Task WithTemporaryDirectory(Func<string, Task> action) {
     Directory.CreateDirectory(directory);
     try { await action(directory); } finally { Directory.Delete(directory, recursive: true); }
 }
+
+static JsonObject NativeConfig(uint[] games) => new() {
+    ["Enabled"] = true,
+    ["SteamLogin"] = "dummy-test-login",
+    ["SteamPassword"] = "dummy-test-password-not-a-real-secret",
+    ["CustomGamePlayedWhileIdle"] = "CUSTOM TEST TEXT",
+    ["FarmingPreferences"] = 129,
+    ["GamesPlayedWhileIdle"] = new JsonArray(games.Select(id => (JsonNode?)JsonValue.Create(id)).ToArray()),
+    ["SmartIdle"] = new JsonObject { ["Enabled"] = true, ["RotationMinutes"] = 120, ["SelectionMode"] = "LeastPlaytime" },
+    ["OtherPlugin"] = new JsonObject { ["Enabled"] = true, ["Text"] = "原有设置", ["Values"] = new JsonArray(1, 2, 3) }
+};
+static async Task<JsonObject> ReadObject(string path) => JsonNode.Parse(await File.ReadAllTextAsync(path))!.AsObject();
+static uint[] ReadGames(JsonObject config) => config["GamesPlayedWhileIdle"]!.AsArray().Select(value => value!.GetValue<uint>()).ToArray();

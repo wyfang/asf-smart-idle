@@ -27,6 +27,7 @@ public sealed class IdleState {
     // Optional additions retain compatibility with version 0.1's schema-1 files.
     public Dictionary<uint, double> EstimatedPlaytimeMinutes { get; set; } = [];
     public string? LastSelectionMode { get; set; }
+    public bool RestoreOriginalOnIdle { get; set; }
 
     public void Validate() {
         if (SchemaVersion != CurrentSchemaVersion) {
@@ -42,6 +43,7 @@ public sealed class IdleState {
         if (LastSelectionMode is not null && !IdleOptions.IsValidSelectionMode(LastSelectionMode)) {
             throw new InvalidDataException("SmartIdle 保存的轮换模式无效。");
         }
+        if (RestoreOriginalOnIdle && !Paused) throw new InvalidDataException("还原原始名单的请求必须暂停插件轮换。");
         foreach (var pair in EstimatedPlaytimeMinutes) {
             if (pair.Key == 0 || !double.IsFinite(pair.Value) || pair.Value < 0) {
                 throw new InvalidDataException("SmartIdle 保存的估算时长无效。");

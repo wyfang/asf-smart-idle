@@ -2,6 +2,8 @@ using System.Composition;
 using System.Text.Json;
 using ArchiSteamFarm.Plugins.Interfaces;
 using SmartIdle.Core;
+using SteamKit2;
+using SteamKit2.Internal;
 
 namespace SmartIdle.HostProbe;
 
@@ -17,14 +19,57 @@ public sealed class HostProbePlugin : IPlugin {
         string directory = Path.Combine(Path.GetTempPath(), "smartidle-host-probe-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         try {
-            phase = "custom-status-transition";
-            int transitionStep = 0;
-            bool played = await PlaybackTransition.ApplyAsync("WYFANG.NET", () => ++transitionStep == 1,
-                () => ++transitionStep == 3, delay: (duration, _) => {
-                    Check(++transitionStep == 2 && duration.TotalMilliseconds == 500, "Custom status reset gap invalid.");
-                    return Task.CompletedTask;
-                }).ConfigureAwait(false);
-            Check(played && transitionStep == 3, "Custom status transition order invalid.");
+            phase = "native-config-store";
+            string nativeConfig = Path.Combine(directory, "SyntheticBot.json");
+            string originalConfig = "{\"GamesPlayedWhileIdle\":[10,730],\"CustomGamePlayedWhileIdle\":\"WYFANG.NET\",\"FarmingPreferences\":129,\"SteamLogin\":\"synthetic\",\"SmartIdle\":{\"Enabled\":true}}";
+            await File.WriteAllTextAsync(nativeConfig, originalConfig).ConfigureAwait(false);
+            Check(await NativeIdleConfigStore.ApplyAsync(nativeConfig, new uint[] { 570, 440 }).ConfigureAwait(false), "Native playlist was not applied.");
+            Check(!await NativeIdleConfigStore.ApplyAsync(nativeConfig, new uint[] { 570, 440 }).ConfigureAwait(false), "Identical playlist caused another write.");
+            Check(await NativeIdleConfigStore.MatchesAsync(nativeConfig, new uint[] { 570, 440 }).ConfigureAwait(false), "Managed config does not match batch.");
+            Check(await NativeIdleConfigStore.RestoreAsync(nativeConfig).ConfigureAwait(false), "Native playlist was not restored.");
+            Check(await NativeIdleConfigStore.MatchesAsync(nativeConfig, new uint[] { 10, 730 }).ConfigureAwait(false), "Original playlist was lost.");
+            using (var nativeJson = JsonDocument.Parse(await File.ReadAllTextAsync(nativeConfig).ConfigureAwait(false))) {
+                Check(JsonField(nativeJson.RootElement, "CustomGamePlayedWhileIdle").GetString() == "WYFANG.NET" && JsonField(nativeJson.RootElement, "FarmingPreferences").GetInt32() == 129, "Unrelated native configuration changed.");
+            }
+
+            phase = "playback-packet-parsing";
+            uint libraryOwner = 0;
+            var session = new SteamSession(id => libraryOwner = id);
+            var libraryPacket = new ClientMsgProtobuf<CMsgClientSharedLibraryLockStatus>(EMsg.ClientSharedLibraryLockStatus);
+            libraryPacket.Body.own_library_locked_by = 123;
+            session.HandleMsg(new PacketClientMsgProtobuf(EMsg.ClientSharedLibraryLockStatus, libraryPacket.Serialize()));
+            Check(libraryOwner == 123, "Library-lock packet was not dispatched.");
+            var prior = new ProbeNetworkListener();
+            var trace = new SteamSession.PlaybackTrace(prior);
+            trace.OnOutgoingNetworkMessage(EMsg.ClientHeartBeat, []);
+            Check(trace.Describe().Contains("未观察到"), "Trace inspected unrelated traffic.");
+            var playbackPacket = new ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayedWithDataBlob);
+            playbackPacket.Body.games_played.Add(new CMsgClientGamesPlayed.GamePlayed { game_id = new GameID(11390) });
+            playbackPacket.Body.games_played.Add(new CMsgClientGamesPlayed.GamePlayed {
+                game_extra_info = "WYFANG.NET", game_id = new GameID { AppType = GameID.GameType.Shortcut, ModID = uint.MaxValue }
+            });
+            trace.OnOutgoingNetworkMessage(EMsg.ClientGamesPlayedWithDataBlob, playbackPacket.Serialize());
+            string traced = trace.Describe();
+            Check(traced.Contains("WYFANG.NET") && traced.Contains("11390") && traced.Contains("ASF/其他插件"), "Trace failed to parse playback.");
+            trace.Close();
+            trace.OnOutgoingNetworkMessage(EMsg.ClientGamesPlayedWithDataBlob, playbackPacket.Serialize());
+            trace.OnIncomingNetworkMessage(EMsg.ClientHeartBeat, []);
+            Check(trace.Describe() == traced && prior.Outgoing == 3 && prior.Incoming == 1, "Trace lifetime or listener forwarding invalid.");
+
+            phase = "playback-lifecycle";
+            var lifecycle = new PlaybackLifecycle();
+            var connectedAt = DateTimeOffset.UtcNow;
+            lifecycle.OnConnected(connectedAt);
+            Check(lifecycle.CanPlay(connectedAt), "Semantic idle ownership should not require a login takeover delay.");
+            lifecycle.OnPlayingBlocked(true, connectedAt.AddSeconds(4), 60);
+            lifecycle.OnLibraryBlocked(true, connectedAt.AddSeconds(5), 60);
+            lifecycle.OnPlayingBlocked(false, connectedAt.AddSeconds(6), 60);
+            Check(!lifecycle.CanPlay(connectedAt.AddHours(1)), "Shared-library lock was cleared by a play unlock.");
+            lifecycle.OnLibraryBlocked(false, connectedAt.AddSeconds(7), 60);
+            Check(!lifecycle.CanPlay(connectedAt.AddSeconds(66.5)) && lifecycle.CanPlay(connectedAt.AddSeconds(67)), "Occupation cooldown invalid.");
+            Check(!lifecycle.OnLibraryBlocked(false, connectedAt.AddSeconds(8), 60) && lifecycle.ReadyAfter == connectedAt.AddSeconds(67), "Duplicate unlock extended cooldown.");
+            lifecycle.OnDisconnected();
+            Check(!lifecycle.CanPlay(connectedAt.AddHours(1)), "Disconnected lifecycle allowed playback.");
 
             phase = "config-json";
             var defaults = JsonSerializer.Deserialize<IdleOptions>("{\"Enabled\":true}", IdleJson.Options)
@@ -226,6 +271,18 @@ public sealed class HostProbePlugin : IPlugin {
         try { action(); }
         catch (TException) { return; }
         throw new InvalidOperationException("Expected " + typeof(TException).Name + ".");
+    }
+
+    private static JsonElement JsonField(JsonElement root, string name) {
+        foreach (var property in root.EnumerateObject()) if (property.Name == name) return property.Value;
+        throw new InvalidOperationException("Missing synthetic field: " + name);
+    }
+
+    private sealed class ProbeNetworkListener : IDebugNetworkListener {
+        internal int Incoming;
+        internal int Outgoing;
+        public void OnIncomingNetworkMessage(EMsg msgType, byte[] data) => Incoming++;
+        public void OnOutgoingNetworkMessage(EMsg msgType, byte[] data) => Outgoing++;
     }
 
     private static async Task ExpectAsync<TException>(Func<Task> action) where TException : Exception {

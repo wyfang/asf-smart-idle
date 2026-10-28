@@ -1,6 +1,6 @@
 # ASF SmartIdle
 
-An ArchiSteamFarm plugin with explicit manual pins and a fixed approved rotation pool, supporting lowest playtime first, random selection and round-robin scheduling.
+An ArchiSteamFarm plugin with manual pins and a fixed approved rotation pool, using ASF’s native `GamesPlayedWhileIdle` playback with lowest-playtime, random and round-robin selection.
 
 [Build downloads](https://github.com/wyfang/asf-smart-idle/actions/workflows/build.yml) · [简体中文](./README.md)
 
@@ -10,14 +10,15 @@ An ArchiSteamFarm plugin with explicit manual pins and a fixed approved rotation
 - By default only the initial scan runs. Restarts, reconnects and rotation reuse the local snapshot; newcomers discovered by manual scans remain pending.
 - Manual pins bypass zero-playtime and library-discovery filters; verify their licenses yourself. The chosen strategy fills the remaining slots: up to 32 games without a custom status, or 31 with it.
 - Includes exclusions, per-game explanations, batch previews, manual rotation, and persistent queue and pause state.
-- Preserves existing ASF configuration and custom status; card farming and personal gameplay take priority, and interruptions do not consume the batch timer.
+- Manages ASF’s native idle playlist for selected bots, preserving custom text, farming preferences and other account settings; backs up the original playlist for restoration.
+- Does not update the idle list during card farming or personal gameplay. Interruptions do not consume the batch timer; changed batches reload the selected bot’s configuration and briefly reconnect it.
 - Does not detect free games, query store prices, or distinguish personal gameplay from historical ASF card-farming time.
 
 ## Usage
 
 ### Requirements and installation
 
-The current build targets **ASF 6.3.10.6 / .NET 10**. Plugin loading, scheduling and persistence have been checked in the generic host and a `linux-x64` Docker host. A real account was used to check library retrieval, pins, manual rotation, pause and resume. A live account also confirmed that ASF card farming takes over playback, SmartIdle does not overwrite its playlist, the rotation countdown and local playtime estimates stop during farming, and the original batch resumes after restoring the original configuration. The test did not wait for a complete card-drop cycle. Other ASF versions and long-running operation remain unverified.
+Current version: **0.3.0**, targeting **ASF 6.3.10.6 / .NET 10**. Loading and isolated smoke tests passed in generic and trimmed `linux-x64` hosts. Native idle-list rotation, outgoing custom text, original-list backup and restoration, and yielding to card farming were also verified with a live account in the official `linux-x64` Docker image. Farming checks covered starting, continuing, stopping, and deferring restoration during farming; a full card-drop cycle was not observed. Other ASF versions and long-running operation remain unverified.
 
 1. Use the build command below to create `SmartIdle.zip`. If downloading a GitHub Actions artifact, extract the outer artifact archive first.
 2. Stop ASF and extract `SmartIdle.zip` into its `plugins/` directory. The resulting paths must include `plugins/SmartIdle/SmartIdle.dll` and `plugins/SmartIdle/SmartIdle.Core.dll`.
@@ -73,9 +74,13 @@ Without a custom status, 10 pins leave 22 rotating slots out of 32; with a statu
 !SIDLE BotName UNPIN 730
 ```
 
-Keep existing `GamesPlayedWhileIdle`, `CustomGamePlayedWhileIdle`, `FarmingPreferences` and other ASF settings; merge only the new `SmartIdle` object. SmartIdle takes over idle playback while running and preserves custom status. Existing settings remain available when paused or removed. The plugin does not edit these fields or pause/resume the farmer. It may idle during a configured `FarmingPausedByDefault` startup pause; active card farming takes priority.
+During installation, merge only the new `SmartIdle` object and retain existing ASF settings. When enabled, the plugin first saves the original `GamesPlayedWhileIdle` to `SmartIdle-native/<BotName>.json` beneath ASF’s configuration directory, then writes the selected pins and rotating batch to that bot’s `GamesPlayedWhileIdle`. The default batch lasts 120 active minutes. An unchanged playlist does not trigger another configuration write. `CustomGamePlayedWhileIdle`, `FarmingPreferences`, credentials and other configuration values are preserved. ASF itself handles playback, custom text and card farming.
 
-Use `SIDLE BotName PAUSE` / `SIDLE BotName RESUME` to pause/resume the plugin. Pausing returns control to ASF's original idle playlist rather than stopping all ASF idling. A startup pause and later native `pause`/`play` cannot always be distinguished; run `SIDLE PAUSE` before these native commands to prevent takeover. Personal gameplay yields through Steam's session-occupation signal. Plugin `RESUME` does not unpause ASF's farmer.
+An actual playlist change makes ASF reload the selected bot’s configuration, which may briefly disconnect and reconnect that account. Other bots do not need to reconnect. Recovery depends on Steam and the network; no fixed duration is guaranteed. An internal batch reload preserves the previous farmer pause state; a complete ASF restart still follows its configured startup policy. Idle-list changes are deferred during card farming or personal occupation.
+
+`SIDLE BotName PAUSE` persistently pauses the plugin and restores the backed-up idle list; `SIDLE BotName RESUME` manages the list again. Pausing the plugin does not stop all ASF idling: the original list may continue playing. Run `SIDLE PAUSE` before ASF’s native `pause`/`play` commands. Plugin `RESUME` does not unpause ASF’s farmer. With `FarmingPausedByDefault`, the plugin may manage idle playback during that configured startup pause.
+
+Before uninstalling, run `SIDLE BotName RESTORE` to restore the original list and set that bot’s `SmartIdle.Enabled` to `false`. If the user has independently changed `GamesPlayedWhileIdle`, restoration preserves that new list and relinquishes management instead of overwriting it from the backup. A corrupt backup stops restoration and leaves the current configuration in place for inspection.
 
 ### Commands
 
@@ -92,7 +97,9 @@ All commands require Master or Owner access to the target bot. The table omits t
 | `SIDLE PIN <AppID...>` / `SIDLE UNPIN <AppID...>` | Add / remove manual pins; removed pins only rotate if approved with recorded time |
 | `SIDLE EXCLUDE <AppID...>` / `SIDLE UNEXCLUDE <AppID...>` | Add / remove runtime exclusions |
 | `SIDLE WHY <AppID...>` / `SIDLE PREVIEW` | Explain eligibility / preview the batch and remaining queue |
-| `SIDLE PAUSE` / `SIDLE RESUME` | Persistently pause / resume the plugin |
+| `SIDLE PAUSE` / `SIDLE RESUME` | Pause and restore the original list / manage the idle list again |
+| `SIDLE RESTORE` | Restore the original list and disable the plugin before uninstalling |
+| `SIDLE TRACE` | Temporarily sample 15 seconds of actual outgoing playback lists and custom text; unrelated traffic is not recorded |
 | `SIDLE ROTATE` | Select the next batch while retaining pins |
 
 Removing a runtime exclusion does not override configuration `Blacklist` entries or approve the game. `PREVIEW` shows a candidate playlist; it does not prove that Steam accepted playback or credited playtime.
@@ -105,7 +112,7 @@ Install the .NET 10 SDK, Python 3, and curl on macOS or Linux, then run from the
 ./scripts/build.sh
 ```
 
-The script downloads the pinned official ASF 6.3.10.6 generic release and checks SHA512, then builds and runs tests before creating the installation archive. Reference dependencies are cached at `~/Library/Caches/asf-smart-idle/6.3.10.6/` on macOS or `${XDG_CACHE_HOME:-$HOME/.cache}/asf-smart-idle/6.3.10.6/` on Linux. The package contains no ASF, .NET, test probe, or game files. Its default destination is `~/Documents/Codex/outputs/asf-smart-idle/v0.2.1/SmartIdle.zip`.
+The script downloads the pinned official ASF 6.3.10.6 generic release and checks SHA512, then builds and runs tests before creating the installation archive. Reference dependencies are cached at `~/Library/Caches/asf-smart-idle/6.3.10.6/` on macOS or `${XDG_CACHE_HOME:-$HOME/.cache}/asf-smart-idle/6.3.10.6/` on Linux. The package contains no ASF, .NET, test probe, or game files. Its default destination is `~/Documents/Codex/outputs/asf-smart-idle/v0.3.0/SmartIdle.zip`.
 
 Run `python3 scripts/smoke-test.py` to check loading and synthetic scheduling/persistence in the real generic host. It uses a temporary directory, disabled synthetic bots and loopback-only IPC, without logging in to Steam. GitHub Actions repeats the check with the official trimmed `linux-x64` release, catching incompatibilities hidden by a complete runtime.
 
@@ -113,17 +120,18 @@ Use `DOTNET` to specify the dotnet executable and `OUTPUT_DIR` to choose the pac
 
 ## Notes
 
-- With custom status text, startup, rotation and restoration of the original playlist first clear the playing state, wait 500 milliseconds, then send the text and games, following the ASF 6.3.10.6 Steam workaround. The account stays connected; friend-list refresh also depends on network and client caching. This gap does not count toward local playtime estimates or the batch timer. No deliberate delay is used without custom text.
+- ASF’s native functionality sends playback and custom text. The plugin includes no Harmony dependency and does not modify ASF’s program. Configuration reloads and Steam friend-state refresh may produce a brief gap; offline and paused time do not count toward local running estimates.
 
 - Library/playtime data use the bot's existing Steam connection, without store lookups or Web API keys. With default `RefreshHours: 0`, an existing snapshot is reused across restarts, reconnects and rotations. Use `SCAN` to calibrate or discover newcomers. Basic login, heartbeat and playback-status traffic still exists.
 - No games are launched or downloaded. Steam playtime can update late; the plugin timer schedules rotation and does not represent Steam-confirmed credited minutes.
 - Initial scans retry after 5 minutes when no snapshot exists. A failed manual refresh with a cached snapshot retains it without automatic retry in manual mode. With automatic refresh disabled, later real playtime or license changes only appear after a manual scan. ASF's occupation cooldown is observed after personal gameplay ends.
+- Original idle-list backups are stored at `SmartIdle-native/<BotName>.json` beneath ASF’s configuration directory. An absent field and an explicit empty array are distinguished and restored in their original form. When renaming a bot configuration, rename its playlist backup as well.
 - Per-account state is stored at `SmartIdle-state/<SteamID>.json` beneath ASF's configuration directory. It contains game names and playtime, approved and pending lists, pins, queue, and pause state. Lists are bound to the SteamID rather than shared by bot name.
 - Enable `SmartIdle.Enabled` only in the bot configurations you select; it defaults to off. Only one SmartIdle bot may manage the same Steam account within a configuration directory. Duplicate instances refuse to take control.
 - State writes are atomic. Checkpoints occur every 5 minutes and on list changes, rotation, and normal shutdown. A forced termination can repeat roughly the last 5 unsaved minutes of the batch; power-loss durability also depends on the filesystem.
 - Corrupt or incompatible state, or a write failure, stops scheduling and preserves the existing file. Do not delete state while troubleshooting unless you intend to rebuild the approved list. Back up the complete account state file.
 - Logs use ASF's existing logging system and retention settings. The plugin does not run a separate database or web service.
-- To uninstall, stop ASF, remove `plugins/SmartIdle/` and the bot's `SmartIdle` configuration, then restart. Retain the state directory to restore the approved list when re-enabling the plugin.
+- To uninstall, first run `SIDLE BotName RESTORE` while the plugin is still installed. Confirm that the original list is restored and the plugin is disabled, then stop ASF, remove `plugins/SmartIdle/` and the bot’s `SmartIdle` configuration, and restart. Retain `SmartIdle-state/` and `SmartIdle-native/` for recovery; do not delete the original-list backup first.
 
 ## License
 

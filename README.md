@@ -1,6 +1,6 @@
 # ASF SmartIdle
 
-为 ArchiSteamFarm 提供手动常驻名单与固定清单轮换：轮换池排除累计时长为 0 的游戏，支持低时长优先、完全随机和公平队列。
+为 ArchiSteamFarm 提供手动常驻名单与固定清单轮换，通过 ASF 原生 `GamesPlayedWhileIdle` 播放，支持低时长优先、完全随机和公平队列。
 
 [构建下载](https://github.com/wyfang/asf-smart-idle/actions/workflows/build.yml) · [English](./README.en.md)
 
@@ -10,14 +10,15 @@
 - 默认只在首次读取；之后的重启、重连和轮换使用本地快照，手动刷新后新候选仍须批准。
 - 手动常驻不受零时长或游戏库遗漏限制，需自行确认许可证；剩余位置按选定策略填满。无自定义状态时最多 32 款，保留自定义状态时最多 31 款。
 - 支持禁止名单、逐款解释、播放预览、手动换批，以及重启后继续队列和暂停状态。
-- 保留 ASF 原有配置和自定义状态；挂卡或本人游玩期间让出调度，中断期间不消耗本批轮换时间。
+- 仅在选定机器人上管理 ASF 原生空闲游戏列表，保留自定义文案、挂卡偏好和账号等其他配置；原名单先备份，支持还原。
+- 挂卡或本人游玩期间不更新空闲列表，中断期间不消耗本批轮换时间；换批通过该机器人的配置重载生效，会短暂重连。
 - 不识别免费游戏，不查询商店价格，不区分本人游玩与 ASF 挂卡产生的历史时长。
 
 ## 使用
 
 ### 运行条件与安装
 
-当前编译目标为 **ASF 6.3.10.6 / .NET 10**。已在 generic 宿主和 `linux-x64` Docker 中验证插件加载、清单调度与状态读写，并在真实账号上验证游戏库读取、常驻与手动换批、暂停恢复。另已在真实账号上验证：ASF 启动挂卡时插件让出播放，挂卡期间不抢占列表，轮换倒计时与本地时长估算冻结，恢复原配置后继续原批次；未等待整轮掉卡结束。其他 ASF 版本与长时间运行尚未验证。
+当前版本 **0.3.0**，编译目标为 **ASF 6.3.10.6 / .NET 10**。已在 generic 宿主和裁剪后的 `linux-x64` 宿主验证加载与隔离烟测，并在官方 `linux-x64` Docker 的真实账号上验证原生清单换批、自定义文案发送、原名单备份还原及挂卡让位。挂卡测试覆盖开始、持续、停止及期间延后还原，未等待完整掉卡周期。其他 ASF 版本与长时间运行尚未验证。
 
 1. 运行下文构建命令，得到 `SmartIdle.zip`；若从 GitHub Actions 下载构建产物，先解开外层 artifact 压缩包。
 2. 停止 ASF，把 `SmartIdle.zip` 解压到 ASF 的 `plugins/`，最终应有 `plugins/SmartIdle/SmartIdle.dll` 和 `plugins/SmartIdle/SmartIdle.Core.dll`。
@@ -73,9 +74,13 @@
 !SIDLE BotName UNPIN 730
 ```
 
-保留 `GamesPlayedWhileIdle`、`CustomGamePlayedWhileIdle`、`FarmingPreferences` 等已有 ASF 配置，只合并新增的 `SmartIdle` 对象。插件运行时接管空闲播放，保留自定义状态；暂停或卸载时原配置仍可使用。插件不会修改这些配置字段，也不主动暂停或恢复挂卡模块。配置为 `FarmingPausedByDefault` 时，插件可在这个启动暂停期间挂时长；若挂卡模块运行，则挂卡优先。
+安装时只合并新增的 `SmartIdle` 对象，保留已有 ASF 设置。启用后，插件先把原始 `GamesPlayedWhileIdle` 保存到 ASF 配置目录下的 `SmartIdle-native/<BotName>.json`，再将选中的常驻和轮换批次写入该机器人的 `GamesPlayedWhileIdle`。默认每 120 分钟有效运行时间换一批；列表没有变化时不重复写配置。`CustomGamePlayedWhileIdle`、`FarmingPreferences`、凭据及其他配置值保持不变。播放状态、自定义文案和挂卡由 ASF 自身处理。
 
-暂停和恢复插件请使用 `SIDLE BotName PAUSE` / `SIDLE BotName RESUME`。暂停插件会交还 ASF 原空闲播放列表，并不是停止所有 ASF 挂机。原生启动暂停与后续手动 `pause`／`play` 无法在所有情况下区分，使用这些原生命令前先 `SIDLE PAUSE`，避免插件重新接管；本人在客户端开始游玩则由 Steam 占用状态让位。插件 `RESUME` 不会解除 ASF 的暂停。
+每次实际修改游戏列表后，ASF 会重载该机器人的配置，账号可能短暂断开并重连；其他机器人不需要重连。恢复时间取决于 Steam 和网络，不能保证固定秒数。插件内部换批重载会保留重载前的挂卡暂停状态；完整重启 ASF 仍遵循原有启动策略。挂卡运行或本人占用期间，插件暂缓更新空闲列表。
+
+`SIDLE BotName PAUSE` 先持久暂停插件并恢复备份中的原空闲列表；`SIDLE BotName RESUME` 重新管理列表。暂停插件不是停止所有 ASF 挂机，原空闲名单仍可能继续播放。使用 ASF 原生 `pause`／`play` 命令前先执行 `SIDLE PAUSE`；插件 `RESUME` 不会解除 ASF 挂卡模块的暂停。配置为 `FarmingPausedByDefault` 时，插件可在该启动暂停期间管理空闲播放。
+
+卸载前使用 `SIDLE BotName RESTORE`，恢复原列表并把此机器人的 `SmartIdle.Enabled` 设为 `false`。如果接管期间用户已自行修改 `GamesPlayedWhileIdle`，还原会保留用户新名单并解除管理，不用备份覆盖它；备份损坏时停止还原并保留当前配置，需先检查备份。
 
 ### 命令
 
@@ -92,7 +97,9 @@
 | `SIDLE PIN <AppID...>` / `SIDLE UNPIN <AppID...>` | 手动常驻 / 取消；取消后仅已批准且有时长的项目回轮换 |
 | `SIDLE EXCLUDE <AppID...>` / `SIDLE UNEXCLUDE <AppID...>` | 加入 / 移出运行时禁止名单 |
 | `SIDLE WHY <AppID...>` / `SIDLE PREVIEW` | 解释筛选原因 / 查看候选批次和余下队列 |
-| `SIDLE PAUSE` / `SIDLE RESUME` | 持久暂停 / 恢复插件 |
+| `SIDLE PAUSE` / `SIDLE RESUME` | 暂停并恢复原名单 / 重新管理空闲列表 |
+| `SIDLE RESTORE` | 等待安全空闲后恢复原名单并禁用插件，用于卸载 |
+| `SIDLE TRACE` | 临时采样 15 秒实际发送的播放消息；只记录游戏列表和文案，不记录其他流量 |
 | `SIDLE ROTATE` | 手动选择下一批，保留常驻游戏 |
 
 移出运行时禁止名单不会移除配置 `Blacklist` 的限制，也不会自动批准游戏。`PREVIEW` 展示候选播放列表，不能证明 Steam 已接受播放或计入时长。
@@ -105,7 +112,7 @@
 ./scripts/build.sh
 ```
 
-脚本从官方发布下载固定的 ASF 6.3.10.6 generic 包，验证 SHA512，先编译并运行测试，再生成安装包。引用依赖存放在 macOS 的 `~/Library/Caches/asf-smart-idle/6.3.10.6/` 或 Linux 的 `${XDG_CACHE_HOME:-$HOME/.cache}/asf-smart-idle/6.3.10.6/`。安装包不包含 ASF、.NET、测试探针或游戏文件，默认输出到 `~/Documents/Codex/outputs/asf-smart-idle/v0.2.1/SmartIdle.zip`。
+脚本从官方发布下载固定的 ASF 6.3.10.6 generic 包，验证 SHA512，先编译并运行测试，再生成安装包。引用依赖存放在 macOS 的 `~/Library/Caches/asf-smart-idle/6.3.10.6/` 或 Linux 的 `${XDG_CACHE_HOME:-$HOME/.cache}/asf-smart-idle/6.3.10.6/`。安装包不包含 ASF、.NET、测试探针或游戏文件，默认输出到 `~/Documents/Codex/outputs/asf-smart-idle/v0.3.0/SmartIdle.zip`。
 
 运行 `python3 scripts/smoke-test.py` 可在真实 generic 宿主中执行加载与清单读写探针；它使用临时目录、禁用的合成机器人和仅监听本机的 IPC，不登录 Steam。GitHub Actions 还会用官方 `linux-x64` 裁剪发布包执行同一检查，避免仅在完整运行时通过。
 
@@ -113,17 +120,18 @@
 
 ## 说明
 
-- 配置自定义文案时，启动、轮换和交还原有播放列表会先清空游戏状态，等待 500 毫秒后再发送文案和游戏列表，沿用 ASF 6.3.10.6 的 Steam 兼容处理。账号不下线；好友列表的实际刷新还受网络和客户端缓存影响。空档不计入本地时长估算或批次倒计时。无自定义文案时不主动等待。
+- 播放与自定义文案由 ASF 原生功能发送。插件不包含 Harmony，也不修改 ASF 程序；配置重载和 Steam 好友状态刷新可能造成短暂空档，离线和暂停时间不计入本地运行估算。
 
 - 游戏库和时长通过机器人现有 Steam 连接读取，不查询商店、不需要 Web API Key。默认 `RefreshHours: 0`，已有快照时重启、重连、换批均不重新查询；`SCAN` 可手动校准和发现新候选。登录、保活和发送播放状态等基础通信仍然存在。
 - 没有实际启动或下载游戏。Steam 时长可能延迟更新；插件计时只用于调度，不等于经 Steam 确认的新增时长。
 - 首次没有快照且读取失败时每 5 分钟重试；已有快照的手动刷新失败则继续使用旧数据，手动模式不自动重试。关闭自动刷新意味着之后的真实游玩时长或许可证变化要等手动刷新才会反映。本人游玩结束后等待 ASF 的占用冷却再恢复。
+- 原空闲列表的备份保存在 ASF 配置目录下的 `SmartIdle-native/<BotName>.json`；原字段不存在与显式空数组会分别保留，还原时恢复原有形式。重命名机器人配置时，应同时重命名对应的名单备份。
 - 每个账号的状态保存在 ASF 配置目录下的 `SmartIdle-state/<SteamID>.json`，包含游戏名称、时长、批准和待加入清单、常驻、队列及暂停状态。按 SteamID 隔离，不以机器人名称共享清单。
 - 只在需要的机器人配置中启用 `SmartIdle.Enabled`；默认关闭。同一配置目录中，同一个 Steam 账号只能由一个 SmartIdle 机器人管理，重复实例会拒绝接管。
 - 状态原子写入，每 5 分钟检查点保存，并在清单变更、换批和正常退出时保存。强制终止可能让最后未保存的约 5 分钟重复计时；断电时的持久性还取决于文件系统。
 - 状态损坏、版本不兼容或无法写入时停止调度并保留原文件。不要删除状态来排障，除非确实需要重新建立批准清单；备份时保存整个账号状态文件。
 - 日志写入 ASF 现有日志系统，保留策略由 ASF 配置负责。插件不提供独立数据库或网页服务。
-- 卸载时停止 ASF，删除 `plugins/SmartIdle/` 并移除机器人里的 `SmartIdle` 配置，然后重启。保留状态目录便于恢复；重新启用后会继续使用原批准清单。
+- 卸载顺序：在插件仍安装时执行 `SIDLE BotName RESTORE`，确认原名单恢复且插件已禁用，再停止 ASF、删除 `plugins/SmartIdle/` 并移除机器人中的 `SmartIdle` 配置，最后重启。保留 `SmartIdle-state/` 和 `SmartIdle-native/` 便于恢复；不要先删除原名单备份。
 
 ## 版权说明
 
