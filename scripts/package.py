@@ -29,7 +29,7 @@ def main() -> None:
         if path.is_file() and not path.is_symlink():
             files[f"SmartIdle/examples/{path.name}"] = path
 
-    default_output = Path.home() / "Documents" / "Codex" / "outputs" / "asf-smart-idle" / "v0.3.0"
+    default_output = Path.home() / "Documents" / "Codex" / "outputs" / "asf-smart-idle" / "v0.4.0"
     output = Path(os.environ.get("OUTPUT_DIR", str(default_output))).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     destination = output / "SmartIdle.zip"

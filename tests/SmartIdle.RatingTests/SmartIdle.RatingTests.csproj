@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/SmartIdle.Core/SmartIdle.Core.csproj" />
+    <Compile Include="../../src/SmartIdle.Plugin/GameRatingService.cs" Link="GameRatingService.cs" />
+  </ItemGroup>
+</Project>

@@ -6,6 +6,200 @@ using SmartIdle.Core;
 int passed = 0;
 int failed = 0;
 var tests = new (string Name, Func<Task> Run)[] {
+    ("评价分使用样本收缩、对数人气、整数范围与无样本中性回退", () => Sync(() => {
+        var now = DateTimeOffset.UtcNow;
+        Equal(74, new GameRating(90, 100, now).Score(80));
+        Equal(83, new GameRating(90, 100, now).Score(100));
+        Equal(100, new GameRating(1, 100000, now).Score(0));
+        Equal(100, new GameRating(1, int.MaxValue, now).Score(0));
+        Equal(1, new GameRating(0, 100000, now).Score(100));
+        Equal(50, new GameRating(0, 0, now).Score(100));
+        // A single positive review is held near the prior, not treated as 100%.
+        Equal(75, new GameRating(1, 1, now).Score(100));
+        new GameRating(0, 0, now.AddYears(-2)).Validate();
+        Throws<ArgumentException>(() => new GameRating(-1, 1, now).Validate());
+        Throws<ArgumentException>(() => new GameRating(2, 1, now).Validate());
+        Throws<ArgumentException>(() => new GameRating(0, -1, now).Validate());
+        Throws<ArgumentException>(() => new GameRating(1, 1, default).Validate());
+        Throws<ArgumentException>(() => new GameRating(1, 1, now.AddDays(1)).Validate());
+        Throws<ArgumentOutOfRangeException>(() => new GameRating(1, 1, now).Score(101));
+    })),
+    ("单槽有效服务长期接近90比60比30，不受Steam旧时长影响", () => Sync(() => {
+        var planner = Weighted(1, (1, 90), (2, 60), (3, 30));
+        planner.RefreshLibrary([Game(1, 1000000), Game(2, 1), Game(3, 100)]);
+        RunWeighted(planner, 600);
+        Near(300 * 120D, planner.State.PluginAllocatedMinutes[1], 240);
+        Near(200 * 120D, planner.State.PluginAllocatedMinutes[2], 240);
+        Near(100 * 120D, planner.State.PluginAllocatedMinutes[3], 240);
+        Near(0.5, planner.State.QualityTargetShares[1]);
+        Near(1D / 3, planner.State.QualityTargetShares[2]);
+        Near(1D / 6, planner.State.QualityTargetShares[3]);
+    })),
+    ("多槽加权按每款最多占一槽封顶，常驻独立且低权重不被挤没", () => Sync(() => {
+        var planner = Weighted(3, (1, 90), (2, 60), (3, 30));
+        planner.Pin([99]);
+        RunWeighted(planner, 600);
+        Near(600 * 120D, planner.State.PluginAllocatedMinutes[1], 240);
+        Near(400 * 120D, planner.State.PluginAllocatedMinutes[2], 240);
+        Near(200 * 120D, planner.State.PluginAllocatedMinutes[3], 240);
+        Near(600 * 120D, planner.State.PluginAllocatedMinutes[99]);
+        Near(1, planner.State.QualityTargetShares[1]);
+        Near(2D / 3, planner.State.QualityTargetShares[2]);
+        Near(1D / 3, planner.State.QualityTargetShares[3]);
+        True(!planner.State.QualityTargetShares.ContainsKey(99));
+        planner.ValidateState();
+    })),
+    ("极端权重保持有限正份额，多槽饱和后低分共享剩余位置", () => Sync(() => {
+        var planner = Weighted(2, (1, 100), (2, 1), (3, 1));
+        planner = new IdlePlanner(planner.Options with { WeightStrength = 4 }, planner.State);
+        RunWeighted(planner, 200);
+        Near(1, planner.State.QualityTargetShares[1]);
+        Near(0.5, planner.State.QualityTargetShares[2]);
+        Near(0.5, planner.State.QualityTargetShares[3]);
+        Near(200 * 120D, planner.State.PluginAllocatedMinutes[1]);
+        Near(100 * 120D, planner.State.PluginAllocatedMinutes[2], 240);
+        Near(100 * 120D, planner.State.PluginAllocatedMinutes[3], 240);
+        var single = Weighted(1, (1, 100), (2, 1));
+        single = new IdlePlanner(single.Options with { WeightStrength = 4 }, single.State);
+        True(single.State.QualityTargetShares[2] > 0);
+        single.AccruePlaytime(single.CurrentOrSelectBatch(), 60000000D * 7200);
+        Sequence([2], single.Rotate());
+        single.ValidateState();
+    })),
+    ("预览与手动换批不虚增服务，实际暂停前的部分运行按秒计入", () => Sync(() => {
+        var planner = Weighted(1, (1, 90), (2, 60), (3, 30));
+        for (int iteration = 0; iteration < 50; iteration++) {
+            planner.CurrentOrSelectBatch();
+            planner.Rotate();
+        }
+        Equal(0, planner.State.PluginAllocatedMinutes.Count);
+        True(planner.State.QualityDeficitSeconds.Values.All(value => value == 0));
+        var batch = planner.CurrentOrSelectBatch();
+        planner.AccruePlaytime(batch, 90);
+        Near(1.5, planner.State.PluginAllocatedMinutes[batch[0]]);
+        double debt = planner.State.QualityDeficitSeconds[batch[0]];
+        planner.Rotate();
+        Near(debt, planner.State.QualityDeficitSeconds[batch[0]]);
+        Near(1.5, planner.State.PluginAllocatedMinutes.Values.Sum());
+    })),
+    ("评分及手动权重改变保持当前批，只重置公平欠额且不追讨旧时长", () => Sync(() => {
+        var planner = Weighted(1, (1, 90), (2, 10));
+        RunWeighted(planner, 25);
+        var batch = planner.CurrentOrSelectBatch().ToArray();
+        double total = planner.State.PluginAllocatedMinutes.Values.Sum();
+        planner.SetWeight(2, 100);
+        Sequence(batch, planner.CurrentOrSelectBatch());
+        Near(total, planner.State.PluginAllocatedMinutes.Values.Sum());
+        True(planner.State.QualityDeficitSeconds.Values.All(value => value == 0));
+        Near(100D / 190, planner.State.QualityTargetShares[2]);
+        planner.SetWeight(1, null);
+        Equal(50, planner.WeightScore(1));
+        Sequence(batch, planner.CurrentOrSelectBatch());
+        planner.RefreshLibrary([Game(1), Game(2), Game(3)]);
+        planner.SetWeight(3, 80);
+        True(!planner.CurrentOrSelectBatch().Contains(3U));
+        planner.Approve([3]);
+        Sequence(batch, planner.CurrentOrSelectBatch());
+        True(planner.State.QualityDeficitSeconds.Values.All(value => value == 0));
+        True(!planner.State.PluginAllocatedMinutes.ContainsKey(3));
+        planner.Exclude([3]);
+        True(!planner.State.QualityTargetShares.ContainsKey(3));
+        Near(total, planner.State.PluginAllocatedMinutes.Values.Sum());
+    })),
+    ("评分未知与陈旧缓存可解释，手动覆盖和恢复自动均不绕过批准", () => Sync(() => {
+        var planner = Create(new IdleOptions { SelectionMode = "QualityWeighted", ConcurrentGames = 1 });
+        planner.RefreshLibrary([Game(1), Game(2)]);
+        Equal(50, planner.WeightScore(1));
+        True(planner.ExplainWeight(1).Contains("中性"));
+        planner.SetWeight(2, 90);
+        Equal(0, planner.CurrentOrSelectBatch().Count);
+        planner.SetRatings(new Dictionary<uint, GameRating> { [1] = new(90, 100, DateTimeOffset.UtcNow.AddDays(-8)) });
+        Equal(74, planner.WeightScore(1));
+        Equal(90, planner.WeightScore(2));
+        True(planner.ExplainWeight(1).Contains("FetchedAt="));
+        True(planner.ExplainWeight(1).Contains("陈旧"));
+        True(planner.ExplainWeight(2).Contains("手动覆盖 90"));
+        planner.SetWeight(2, null);
+        Equal(50, planner.WeightScore(2));
+        planner.ApproveAll();
+        var batch = planner.CurrentOrSelectBatch().ToArray();
+        planner.SetRatings(new Dictionary<uint, GameRating> { [2] = new(1000, 1000, DateTimeOffset.UtcNow) });
+        Sequence(batch, planner.CurrentOrSelectBatch());
+        Equal(74, planner.WeightScore(1));
+        planner.SetRatings(new Dictionary<uint, GameRating>());
+        Equal(74, planner.WeightScore(1));
+        Throws<ArgumentException>(() => planner.SetRatings(new Dictionary<uint, GameRating> { [1] = new(2, 1, DateTimeOffset.UtcNow) }));
+        Equal(74, planner.WeightScore(1));
+        planner.SetRatings(new Dictionary<uint, GameRating> { [1] = new(0, 0, DateTimeOffset.UtcNow) });
+        Equal(50, planner.WeightScore(1));
+    })),
+    ("加权公平状态与自动分跨重启保存，缓存加载不清空未结欠额", async () => {
+        await WithTemporaryDirectory(async directory => {
+            var planner = Create(new IdleOptions { SelectionMode = "QualityWeighted", ConcurrentGames = 1 });
+            planner.RefreshLibrary([Game(1), Game(2), Game(3)]);
+            var ratings = new Dictionary<uint, GameRating> {
+                [1] = new(900, 1000, DateTimeOffset.UtcNow),
+                [2] = new(50, 100, DateTimeOffset.UtcNow)
+            };
+            planner.SetRatings(ratings);
+            planner.ApproveAll();
+            RunWeighted(planner, 11);
+            planner.AccruePlaytime(planner.CurrentOrSelectBatch(), 123);
+            planner.State.RemainingRotationSeconds = 321;
+            string path = Path.Combine(directory, "quality.json");
+            await IdleStateStore.SaveAsync(path, planner.State);
+            var restored = new IdlePlanner(planner.Options, await IdleStateStore.LoadAsync(path));
+            Sequence(planner.CurrentOrSelectBatch(), restored.CurrentOrSelectBatch());
+            Equal(321D, restored.State.RemainingRotationSeconds);
+            foreach (var pair in planner.State.QualityDeficitSeconds) Near(pair.Value, restored.State.QualityDeficitSeconds[pair.Key]);
+            restored.SetRatings(ratings);
+            foreach (var pair in planner.State.QualityDeficitSeconds) Near(pair.Value, restored.State.QualityDeficitSeconds[pair.Key]);
+            for (int iteration = 0; iteration < 30; iteration++) {
+                Sequence(planner.CurrentOrSelectBatch(), restored.CurrentOrSelectBatch());
+                planner.AccruePlaytime(planner.CurrentOrSelectBatch(), 7200);
+                restored.AccruePlaytime(restored.CurrentOrSelectBatch(), 7200);
+                Sequence(planner.Rotate(), restored.Rotate());
+            }
+        });
+    }),
+    ("候选都能同时运行时权重不减少运行时间，并明确解释", () => Sync(() => {
+        var planner = Weighted(5, (1, 100), (2, 1), (3, 50));
+        RunWeighted(planner, 10);
+        foreach (uint id in new uint[] { 1, 2, 3 }) {
+            Near(1200, planner.State.PluginAllocatedMinutes[id]);
+            Near(1, planner.State.QualityTargetShares[id]);
+            True(planner.ExplainWeight(id).Contains("全部同时运行"));
+        }
+    })),
+    ("加权字段校验拒绝非法配置和损坏状态，旧schema1字段可全部缺省", async () => {
+        foreach (var options in new IdleOptions[] {
+            new() { ReputationWeightPercent = -1 }, new() { ReputationWeightPercent = 101 },
+            new() { WeightStrength = 0.249 }, new() { WeightStrength = 4.001 },
+            new() { WeightStrength = double.NaN }, new() { WeightStrength = double.PositiveInfinity },
+            new() { RatingRefreshHours = 0 }, new() { RatingRefreshHours = 8761 }
+        }) Throws<ArgumentException>(() => Create(options));
+        var planner = Weighted(1, (1, 90), (2, 60));
+        Throws<ArgumentException>(() => planner.SetWeight(0, 50));
+        Throws<ArgumentOutOfRangeException>(() => planner.SetWeight(1, 0));
+        Throws<ArgumentOutOfRangeException>(() => planner.SetWeight(1, 101));
+        Throws<InvalidDataException>(() => new IdleState { ManualWeights = new() { [1] = 0 } }.Validate());
+        Throws<InvalidDataException>(() => new IdleState { QualityAutomaticScores = new() { [1] = 101 } }.Validate());
+        Throws<InvalidDataException>(() => new IdleState { QualityTargetShares = new() { [1] = 1.1 } }.Validate());
+        Throws<InvalidDataException>(() => new IdleState { QualityDeficitSeconds = new() { [1] = double.NaN } }.Validate());
+        Throws<InvalidDataException>(() => new IdleState { PluginAllocatedMinutes = new() { [1] = -1 } }.Validate());
+        await WithTemporaryDirectory(async directory => {
+            var old = JsonNode.Parse(JsonSerializer.Serialize(planner.State))!.AsObject();
+            foreach (string field in new[] { "ManualWeights", "PluginAllocatedMinutes", "QualityAutomaticScores", "QualityTargetShares", "QualityDeficitSeconds" }) old.Remove(field);
+            old["LastSelectionMode"] = "RoundRobin";
+            string path = Path.Combine(directory, "old.json");
+            await File.WriteAllTextAsync(path, old.ToJsonString());
+            var loaded = await IdleStateStore.LoadAsync(path);
+            Equal(0, loaded.ManualWeights.Count);
+            Equal(0, loaded.PluginAllocatedMinutes.Count);
+            Equal(0, loaded.QualityTargetShares.Count);
+            loaded.Validate();
+        });
+    }),
     ("播放权限在提交前失效时取消应用，保留当前配置和原名单恢复能力", async () => {
         await WithTemporaryDirectory(async directory => {
             foreach (bool alreadyManaged in new[] { false, true }) {
@@ -738,7 +932,8 @@ var tests = new (string Name, Func<Task> Run)[] {
             planner.Approve([1]);
             string complete = JsonSerializer.Serialize(planner.State);
             foreach (string field in JsonNode.Parse(complete)!.AsObject().Select(pair => pair.Key).ToArray()) {
-                if (field is "EstimatedPlaytimeMinutes" or "LastSelectionMode" or "RestoreOriginalOnIdle") continue;
+                if (field is "EstimatedPlaytimeMinutes" or "LastSelectionMode" or "RestoreOriginalOnIdle" or
+                    "ManualWeights" or "PluginAllocatedMinutes" or "QualityAutomaticScores" or "QualityTargetShares" or "QualityDeficitSeconds") continue;
                 var incomplete = JsonNode.Parse(complete)!.AsObject();
                 incomplete.Remove(field);
                 string original = incomplete.ToJsonString();
@@ -830,6 +1025,25 @@ static IdlePlanner Create(IdleOptions? options = null) => new(options ?? new Idl
 static OwnedGame Game(uint id, uint minutes = 60) => new(id, $"Game {id}", minutes);
 static Task Sync(Action action) { action(); return Task.CompletedTask; }
 static void True(bool condition) { if (!condition) throw new InvalidOperationException("Expected true."); }
+static void Near(double expected, double actual, double tolerance = 1E-8) {
+    if (!double.IsFinite(actual) || Math.Abs(expected - actual) > tolerance) throw new InvalidOperationException($"Expected {expected} ± {tolerance}, got {actual}.");
+}
+static IdlePlanner Weighted(int slots, params (uint Id, int Score)[] games) {
+    var planner = Create(new IdleOptions { SelectionMode = "QualityWeighted", ConcurrentGames = slots });
+    planner.RefreshLibrary(games.Select(game => Game(game.Id)));
+    foreach (var game in games) planner.SetWeight(game.Id, game.Score);
+    planner.ApproveAll();
+    return planner;
+}
+static void RunWeighted(IdlePlanner planner, int batches) {
+    for (int iteration = 0; iteration < batches; iteration++) {
+        var batch = planner.CurrentOrSelectBatch();
+        True(batch.Count <= planner.Options.ConcurrentGames);
+        Equal(batch.Count, batch.Distinct().Count());
+        planner.AccruePlaytime(batch, planner.Options.RotationMinutes * 60D);
+        planner.Rotate();
+    }
+}
 static void Equal<T>(T expected, T actual) {
     if (!EqualityComparer<T>.Default.Equals(expected, actual)) throw new InvalidOperationException($"Expected {expected}, got {actual}.");
 }

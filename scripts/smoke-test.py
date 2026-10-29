@@ -64,12 +64,17 @@ def main():
                             raise RuntimeError("ASF IPC startup timeout") from None
                         time.sleep(0.25)
                 assert result["Success"] and "SIDLE STATUS" in result["Result"], result
+                assert "RATINGS" in result["Result"] and "WEIGHT" in result["Result"], result
                 log.flush()
                 assert "SMARTIDLE_HOST_PROBE_PASS" in log_path.read_text(), "Core probe did not pass in the real host"
                 print("PASS scheduling, JSON and file persistence in the real ASF runtime")
                 print("PASS real ASF loads SmartIdle and routes SIDLE Smoke HELP")
                 result = command("SIDLE Smoke STATUS")
                 assert "等待 Steam 登录" in result["Result"], result
+                for value in ("SIDLE Smoke RATINGS", "SIDLE Smoke WEIGHT 620 95", "SIDLE Smoke WEIGHT 620 AUTO"):
+                    routed = command(value)
+                    assert "等待 Steam 登录" in routed["Result"], routed
+                print("PASS rating and manual-weight commands route to the offline coordinator")
                 print("PASS disabled bot stays offline and waits for Steam login")
                 result = command("SIDLE Conflict STATUS")
                 assert "等待 Steam 登录" in result["Result"], result

@@ -28,13 +28,20 @@ public sealed class IdleState {
     public Dictionary<uint, double> EstimatedPlaytimeMinutes { get; set; } = [];
     public string? LastSelectionMode { get; set; }
     public bool RestoreOriginalOnIdle { get; set; }
+    // Optional scheduling additions keep existing schema-1 state files readable.
+    public Dictionary<uint, int> ManualWeights { get; set; } = [];
+    public Dictionary<uint, double> PluginAllocatedMinutes { get; set; } = [];
+    public Dictionary<uint, int> QualityAutomaticScores { get; set; } = [];
+    public Dictionary<uint, double> QualityTargetShares { get; set; } = [];
+    public Dictionary<uint, double> QualityDeficitSeconds { get; set; } = [];
 
     public void Validate() {
         if (SchemaVersion != CurrentSchemaVersion) {
             throw new InvalidDataException($"不支持的 SmartIdle 状态版本：{SchemaVersion}。");
         }
         if (Library is null || Approved is null || Pending is null || Rejected is null || Excluded is null ||
-            PinnedGames is null || LastConfiguredPins is null || Queue is null || CurrentRotating is null || EstimatedPlaytimeMinutes is null) {
+            PinnedGames is null || LastConfiguredPins is null || Queue is null || CurrentRotating is null || EstimatedPlaytimeMinutes is null ||
+            ManualWeights is null || PluginAllocatedMinutes is null || QualityAutomaticScores is null || QualityTargetShares is null || QualityDeficitSeconds is null) {
             throw new InvalidDataException("SmartIdle 状态包含 null 清单。");
         }
         if (!double.IsFinite(RemainingRotationSeconds) || RemainingRotationSeconds < 0) {
@@ -48,6 +55,20 @@ public sealed class IdleState {
             if (pair.Key == 0 || !double.IsFinite(pair.Value) || pair.Value < 0) {
                 throw new InvalidDataException("SmartIdle 保存的估算时长无效。");
             }
+        }
+        foreach (var scores in new[] { ManualWeights, QualityAutomaticScores }) {
+            foreach (var pair in scores) {
+                if (pair.Key == 0 || pair.Value is < 1 or > 100) throw new InvalidDataException("SmartIdle 保存的游戏权重无效。");
+            }
+        }
+        foreach (var pair in PluginAllocatedMinutes) {
+            if (pair.Key == 0 || !double.IsFinite(pair.Value) || pair.Value < 0) throw new InvalidDataException("SmartIdle 保存的插件分配时长无效。");
+        }
+        foreach (var pair in QualityTargetShares) {
+            if (pair.Key == 0 || !double.IsFinite(pair.Value) || pair.Value is <= 0 or > 1) throw new InvalidDataException("SmartIdle 保存的加权目标份额无效。");
+        }
+        foreach (var pair in QualityDeficitSeconds) {
+            if (pair.Key == 0 || !double.IsFinite(pair.Value)) throw new InvalidDataException("SmartIdle 保存的加权服务欠额无效。");
         }
         foreach (var pair in Library) {
             uint id = pair.Key;

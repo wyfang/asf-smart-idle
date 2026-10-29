@@ -2,9 +2,12 @@
   "SmartIdle": {
     "Enabled": true,
     "ConcurrentGames": 32,
-    "SelectionMode": "LeastPlaytime",
+    "SelectionMode": "QualityWeighted",
     "RotationMinutes": 120,
     "RefreshHours": 0,
+    "ReputationWeightPercent": 80,
+    "WeightStrength": 1,
+    "RatingRefreshHours": 168,
     "PinnedGames": [],
     "Blacklist": []
   }

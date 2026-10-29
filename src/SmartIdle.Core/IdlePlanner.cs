@@ -5,6 +5,7 @@ public sealed class IdlePlanner {
     public IdleOptions Options { get; }
     public IdleState State { get; }
     private readonly HashSet<uint> ConfigurationBlacklist;
+    private IReadOnlyDictionary<uint, GameRating> Ratings = new Dictionary<uint, GameRating>();
 
     public IdlePlanner(IdleOptions options, IdleState state) {
         ArgumentNullException.ThrowIfNull(options);
@@ -38,7 +39,11 @@ public sealed class IdlePlanner {
         // change reselects once, while an unchanged mode preserves its saved batch.
         bool modeChanged = (State.LastSelectionMode ?? "RoundRobin") != Options.SelectionMode;
         State.LastSelectionMode = Options.SelectionMode;
-        if (modeChanged) State.CurrentRotating.Clear();
+        if (modeChanged) {
+            State.CurrentRotating.Clear();
+            State.QualityTargetShares.Clear();
+            State.QualityDeficitSeconds.Clear();
+        }
         if (!State.Initialized || modeChanged) {
             State.RemainingRotationSeconds = Options.RotationMinutes * 60D;
         }
@@ -171,13 +176,82 @@ public sealed class IdlePlanner {
         var ids = Materialize(appIds);
         if (seconds == 0) return;
         var updates = new Dictionary<uint, double>();
+        var allocations = new Dictionary<uint, double>();
         foreach (uint id in ids) {
-            if (!State.Library.ContainsKey(id)) continue;
-            double total = EffectivePlaytimeMinutes(id) + seconds / 60D;
-            if (!double.IsFinite(total)) throw new ArgumentOutOfRangeException(nameof(seconds), "估算时长超过可保存范围。");
-            updates.Add(id, total);
+            double allocated = State.PluginAllocatedMinutes.GetValueOrDefault(id) + seconds / 60D;
+            if (!double.IsFinite(allocated)) throw new ArgumentOutOfRangeException(nameof(seconds), "插件分配时长超过可保存范围。");
+            allocations.Add(id, allocated);
+            if (State.Library.ContainsKey(id)) {
+                double total = EffectivePlaytimeMinutes(id) + seconds / 60D;
+                if (!double.IsFinite(total)) throw new ArgumentOutOfRangeException(nameof(seconds), "估算时长超过可保存范围。");
+                updates.Add(id, total);
+            }
+        }
+        Dictionary<uint, double>? deficits = null;
+        if (Options.SelectionMode == "QualityWeighted") {
+            var served = new HashSet<uint>();
+            foreach (uint id in State.Queue) {
+                if (ids.Contains(id)) served.Add(id);
+            }
+            if (served.Count > 0) {
+                // Only real rotating service creates credit. A partial/native old
+                // batch cannot accrue the credit of slots that were not running.
+                var targets = ComputeQualityShares(State.Queue, served.Count);
+                deficits = new Dictionary<uint, double>(targets.Count);
+                foreach (var pair in targets) {
+                    double value = State.QualityDeficitSeconds.GetValueOrDefault(pair.Key) + pair.Value * seconds - (served.Contains(pair.Key) ? seconds : 0);
+                    if (!double.IsFinite(value)) throw new ArgumentOutOfRangeException(nameof(seconds), "加权服务欠额超过可保存范围。");
+                    deficits.Add(pair.Key, value);
+                }
+            }
         }
         foreach (var pair in updates) State.EstimatedPlaytimeMinutes[pair.Key] = pair.Value;
+        foreach (var pair in allocations) State.PluginAllocatedMinutes[pair.Key] = pair.Value;
+        if (deficits is not null) State.QualityDeficitSeconds = deficits;
+    }
+
+    public void SetRatings(IReadOnlyDictionary<uint, GameRating> ratings) {
+        ArgumentNullException.ThrowIfNull(ratings);
+        var snapshot = new Dictionary<uint, GameRating>();
+        foreach (var pair in Ratings) snapshot.Add(pair.Key, pair.Value);
+        var scores = new Dictionary<uint, int>(State.QualityAutomaticScores);
+        foreach (var pair in ratings) {
+            if (pair.Key == 0 || pair.Value is null) throw new ArgumentException("游戏评价快照包含无效 AppID 或记录。", nameof(ratings));
+            pair.Value.Validate();
+            snapshot[pair.Key] = pair.Value;
+            scores[pair.Key] = pair.Value.Score(Options.ReputationWeightPercent);
+        }
+        Ratings = snapshot;
+        State.QualityAutomaticScores = scores;
+        Normalize();
+    }
+
+    public void SetWeight(uint appId, int? score) {
+        if (appId == 0) throw new ArgumentException("AppID 不能为 0。", nameof(appId));
+        if (score is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(score), "手动权重必须在 1～100 之间。");
+        if (score is int value) State.ManualWeights[appId] = value;
+        else State.ManualWeights.Remove(appId);
+        // Explicit weights never add approval or interrupt the saved batch.
+        Normalize();
+    }
+
+    public int WeightScore(uint appId) => State.ManualWeights.TryGetValue(appId, out int manual) ? manual : AutomaticScore(appId);
+
+    public string ExplainWeight(uint appId) {
+        string source;
+        if (Ratings.TryGetValue(appId, out var rating)) {
+            string freshness = DateTimeOffset.UtcNow - rating.FetchedAt > TimeSpan.FromHours(Options.RatingRefreshHours) ? "，缓存陈旧，继续使用" : "";
+            source = $"Steam 评价 {rating.PositiveReviews}/{rating.TotalReviews} 条好评，FetchedAt={rating.FetchedAt:O}{freshness}";
+            if (rating.TotalReviews == 0) source += "，无评价样本，使用中性分";
+        } else if (State.QualityAutomaticScores.ContainsKey(appId)) {
+            source = "上次自动评分快照，评价明细暂不可用";
+        } else {
+            source = "缺少有效评分，使用中性分，评价样本未知，FetchedAt=无";
+        }
+        string manual = State.ManualWeights.TryGetValue(appId, out int value) ? $"手动覆盖 {value}" : "无手动覆盖";
+        string capacity = Options.SelectionMode == "QualityWeighted" && State.Queue.Count <= Options.ConcurrentGames - State.PinnedGames.Count
+            ? "；候选不超过轮换槽位，全部同时运行，权重不产生时长差异" : "";
+        return $"{source}；自动分 {AutomaticScore(appId)}；{manual}；最终分 {WeightScore(appId)}/100；强度 {Options.WeightStrength:G}；插件分配 {State.PluginAllocatedMinutes.GetValueOrDefault(appId):F1} 分钟{capacity}";
     }
 
     public string Explain(uint appId) {
@@ -244,6 +318,7 @@ public sealed class IdlePlanner {
             if (!ConfigurationBlacklist.Contains(id) && !State.Excluded.Contains(id)) activePins++;
         }
         int slots = Options.ConcurrentGames - activePins;
+        if (Options.SelectionMode == "QualityWeighted") SynchronizeQualityState(slots);
         var rotating = new List<uint>(slots);
         var current = new HashSet<uint>();
         foreach (uint id in State.CurrentRotating) {
@@ -262,6 +337,16 @@ public sealed class IdlePlanner {
                     int comparison = EffectivePlaytimeMinutes(left).CompareTo(EffectivePlaytimeMinutes(right));
                     return comparison != 0 ? comparison : position[left].CompareTo(position[right]);
                 });
+            } else if (Options.SelectionMode == "QualityWeighted") {
+                var position = new Dictionary<uint, int>();
+                for (int index = 0; index < candidates.Count; index++) position.Add(candidates[index], index);
+                double horizon = Options.RotationMinutes * 60D;
+                candidates.Sort((left, right) => {
+                    double leftDue = State.QualityDeficitSeconds.GetValueOrDefault(left) + State.QualityTargetShares.GetValueOrDefault(left) * horizon;
+                    double rightDue = State.QualityDeficitSeconds.GetValueOrDefault(right) + State.QualityTargetShares.GetValueOrDefault(right) * horizon;
+                    int comparison = rightDue.CompareTo(leftDue);
+                    return comparison != 0 ? comparison : position[left].CompareTo(position[right]);
+                });
             } else if (Options.SelectionMode == "Random") {
                 // Fisher-Yates gives every eligible subset the same chance. Repeats
                 // across batches are allowed; duplicates within a batch never are.
@@ -276,6 +361,58 @@ public sealed class IdlePlanner {
             }
         }
         State.CurrentRotating = rotating;
+    }
+
+    private int AutomaticScore(uint appId) => State.QualityAutomaticScores.GetValueOrDefault(appId, 50);
+
+    private void SynchronizeQualityState(int slots) {
+        var targets = ComputeQualityShares(State.Queue, slots);
+        bool changed = targets.Count != State.QualityTargetShares.Count;
+        foreach (var pair in targets) {
+            if (!State.QualityTargetShares.TryGetValue(pair.Key, out double saved) || Math.Abs(pair.Value - saved) > 1E-12) changed = true;
+        }
+        var deficits = new Dictionary<uint, double>(targets.Count);
+        if (changed) {
+            // Changing membership or proportions starts a new fairness epoch.
+            // Newcomers and changed weights never collect a historical backlog.
+            foreach (uint id in targets.Keys) deficits.Add(id, 0D);
+        } else {
+            foreach (uint id in targets.Keys) deficits.Add(id, State.QualityDeficitSeconds.GetValueOrDefault(id));
+        }
+        State.QualityDeficitSeconds = deficits;
+        State.QualityTargetShares = targets;
+    }
+
+    private Dictionary<uint, double> ComputeQualityShares(IEnumerable<uint> appIds, int slots) {
+        var weighted = new List<(uint Id, double Weight)>();
+        double remainingWeight = 0;
+        foreach (uint id in appIds) {
+            double weight = Math.Pow(WeightScore(id) / 100D, Options.WeightStrength);
+            weighted.Add((id, weight));
+            remainingWeight += weight;
+        }
+        weighted.Sort(static (left, right) => {
+            int comparison = right.Weight.CompareTo(left.Weight);
+            return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+        });
+        var result = new Dictionary<uint, double>(weighted.Count);
+        int remainingSlots = Math.Min(slots, weighted.Count);
+        if (remainingSlots <= 0) return result;
+        // Water filling enforces a game's physical upper bound: it can be
+        // present once per batch, even when several slots run concurrently.
+        for (int index = 0; index < weighted.Count; index++) {
+            var game = weighted[index];
+            if (remainingSlots == weighted.Count - index || game.Weight * remainingSlots >= remainingWeight) {
+                result.Add(game.Id, 1D);
+                remainingSlots--;
+                remainingWeight -= game.Weight;
+            } else {
+                double scale = remainingSlots / remainingWeight;
+                for (; index < weighted.Count; index++) result.Add(weighted[index].Id, weighted[index].Weight * scale);
+                break;
+            }
+        }
+        return result;
     }
 
     private void RequireKnown(IEnumerable<uint> ids) {

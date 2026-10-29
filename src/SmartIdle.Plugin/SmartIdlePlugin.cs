@@ -117,7 +117,7 @@ public sealed class SmartIdlePlugin : IBot, IBotModules, IBotConnection, IBotSte
     }
 
     private static readonly HashSet<string> CommandNames = new(StringComparer.OrdinalIgnoreCase) {
-        "STATUS", "SCAN", "LIST", "WHY", "PREVIEW", "TRACE", "APPROVE", "REJECT", "PIN", "UNPIN", "EXCLUDE", "UNEXCLUDE", "PAUSE", "RESUME", "ROTATE", "RESTORE", "HELP"
+        "STATUS", "SCAN", "LIST", "WHY", "PREVIEW", "TRACE", "RATINGS", "WEIGHT", "APPROVE", "REJECT", "PIN", "UNPIN", "EXCLUDE", "UNEXCLUDE", "PAUSE", "RESUME", "ROTATE", "RESTORE", "HELP"
     };
 
     private BotCoordinator? Get(Bot bot) => Coordinators.TryGetValue(bot, out var coordinator) ? coordinator : null;

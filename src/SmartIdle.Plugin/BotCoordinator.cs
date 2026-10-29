@@ -44,6 +44,13 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
     private int LibraryRequests;
     private bool StartupFarmerPause = bot.BotConfig.FarmingPreferences.HasFlag(BotConfig.EFarmingPreferences.FarmingPausedByDefault);
     private uint[] SentGames = [];
+    private GameRatingService? RatingService;
+    private Task<IReadOnlyDictionary<uint, GameRating>>? RatingRefresh;
+    private IReadOnlyDictionary<uint, GameRating>? AppliedRatings;
+    private DateTimeOffset NextRatings;
+    private DateTimeOffset NextManualRatings;
+    private bool ForceRatings;
+    private string? RatingWarning;
 
     internal void Start() {
         if (bot.IsConnectedAndLoggedOn) OnConnected();
@@ -165,6 +172,8 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             }
             LeasePath = StatePath;
             Planner = new IdlePlanner(options, await IdleStateStore.LoadAsync(StatePath, Stop.Token).ConfigureAwait(false));
+            AppliedRatings = null;
+            if (options.SelectionMode == "QualityWeighted") RatingService = GameRatingService.ForDirectory(directory);
             HasLibrarySnapshot = Planner.State.Initialized;
             LibraryVerified = HasLibrarySnapshot;
             ForceScan = !HasLibrarySnapshot;
@@ -205,6 +214,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             }
         }
 
+        PumpRatings();
         if (ConfigReloadPending) { StopTracking(); return; }
         if (Planner.State.Paused) {
             StopTracking();
@@ -244,6 +254,39 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             }
         }
         if (DateTimeOffset.UtcNow >= NextSave) await SaveAsync().ConfigureAwait(false);
+    }
+
+    // Network and cache I/O run outside Gate. Only completed snapshots enter the planner,
+    // so a slow or unavailable rating endpoint cannot hold commands or idle playback.
+    private void PumpRatings() {
+        if (Planner is null || RatingService is null) return;
+        var candidates = new List<uint>(Planner.State.Queue);
+        if (RatingRefresh?.IsCompleted == true) {
+            try {
+                RatingRefresh.GetAwaiter().GetResult();
+                RatingWarning = null;
+            } catch (OperationCanceledException) when (Stop.IsCancellationRequested) { }
+            catch (Exception exception) {
+                RatingWarning = $"评分刷新失败（{exception.GetType().Name}），继续使用旧评分";
+                bot.ArchiLogger.LogGenericWarning($"SmartIdle {RatingWarning}");
+            }
+            RatingRefresh = null;
+            NextRatings = DateTimeOffset.UtcNow.AddMinutes(5);
+        }
+        var snapshot = RatingService.Snapshot(candidates);
+        bool changed = AppliedRatings is null || snapshot.Count != AppliedRatings.Count;
+        if (!changed) foreach (var pair in snapshot) {
+            if (!AppliedRatings!.TryGetValue(pair.Key, out var previous) || previous != pair.Value) { changed = true; break; }
+        }
+        if (snapshot.Count > 0 && changed) {
+            Planner.SetRatings(snapshot);
+            AppliedRatings = snapshot;
+        }
+        if (RatingRefresh is not null || (DateTimeOffset.UtcNow < NextRatings && !ForceRatings) || candidates.Count == 0) return;
+        bool force = ForceRatings;
+        ForceRatings = false;
+        var service = RatingService;
+        RatingRefresh = Task.Run(() => service.RefreshAsync(candidates, options.RatingRefreshHours, force, Stop.Token));
     }
 
     private CancellationTokenSource? BeginConfigWrite(bool requireActive, out long epoch) {
@@ -391,6 +434,28 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
             switch (action) {
                 case "STATUS":
                     response = $"状态：{DescribeStatus()}；模式 {options.SelectionMode}；批准 {state.Approved.Count}，待加入 {state.Pending.Count}，常驻目标 {state.PinnedGames.Count}；当前批次 {Planner.CurrentOrSelectBatch().Count}/{options.ConcurrentGames}；本批剩余 {Math.Ceiling(state.RemainingRotationSeconds / 60)} 分钟；游戏库查询 {LibraryRequests} 次（本次模块运行，未含 ASF 自身通信）。";
+                    if (RatingService is not null) response += $"\n{RatingService.Status}{RatingWarning}";
+                    break;
+                case "RATINGS":
+                    if (RatingService is null) return "SmartIdle：请先将 SelectionMode 设为 QualityWeighted 并重载机器人。";
+                    if (DateTimeOffset.UtcNow < NextManualRatings) return "SmartIdle：评分刷新请求至少间隔 5 分钟。";
+                    NextManualRatings = DateTimeOffset.UtcNow.AddMinutes(5);
+                    ForceRatings = true;
+                    response = "已安排后台刷新已批准轮换游戏的评分；查询受共享限速及失败退避限制，当前批次继续运行。";
+                    break;
+                case "WEIGHT":
+                    if (args.Length != 4 || !uint.TryParse(args[2], NumberStyles.None, CultureInfo.InvariantCulture, out uint weightedId) || weightedId == 0)
+                        throw new ArgumentException("格式：SIDLE [BotName] WEIGHT <AppID> <1～100|AUTO>。");
+                    int? weight = null;
+                    if (!args[3].Equals("AUTO", StringComparison.OrdinalIgnoreCase)) {
+                        if (!int.TryParse(args[3], NumberStyles.None, CultureInfo.InvariantCulture, out int parsedWeight) || parsedWeight is < 1 or > 100)
+                            throw new ArgumentException("手动权重必须在 1～100 之间，AUTO 恢复自动评分。");
+                        weight = parsedWeight;
+                    }
+                    Planner.SetWeight(weightedId, weight);
+                    response = $"{weightedId}：{Planner.ExplainWeight(weightedId)}；下次选择批次时生效，当前批次保持。";
+                    if (options.SelectionMode != "QualityWeighted") response += " 当前模式不使用评分权重，请切换到 QualityWeighted。";
+                    save = true;
                     break;
                 case "SCAN":
                     if (DateTimeOffset.UtcNow < NextManualScan) return "SmartIdle：刷新请求过于频繁，请稍后再试（至少间隔 5 分钟）。";
@@ -399,7 +464,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
                 case "LIST": response = List(Sequence.Argument(args, 2), Sequence.Argument(args, 3)); break;
                 case "WHY":
                     var reasons = new List<string>();
-                    foreach (uint id in ParseIds(args)) reasons.Add($"{id}：{Planner.Explain(id)}");
+                    foreach (uint id in ParseIds(args)) reasons.Add($"{id}：{Planner.Explain(id)}；{Planner.ExplainWeight(id)}");
                     response = string.Join('\n', reasons); break;
                 case "PREVIEW":
                     var batch = Planner.CurrentOrSelectBatch();
@@ -437,6 +502,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
                 NativeConfigInitialized = false;
                 await SaveAsync().ConfigureAwait(false);
             }
+            if (action is "APPROVE" or "UNPIN" or "UNEXCLUDE") NextRatings = DateTimeOffset.MinValue;
             return "SmartIdle：" + response;
         } catch (ArgumentException exception) { return "SmartIdle：" + exception.Message; }
         catch (Exception exception) {
@@ -493,7 +559,8 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         foreach (uint id in ids) {
             string name = Planner!.State.Library.TryGetValue(id, out var game) ? game.Name.Replace('\r', ' ').Replace('\n', ' ') : "未知游戏";
             if (name.Length > 60) name = name[..60];
-            lines.Add($"{id} · {name} · Steam 快照 {game?.PlaytimeMinutes ?? 0} 分钟 · 排序估算 {Planner.EffectivePlaytimeMinutes(id):F1} 分钟 · {Planner.Explain(id)}");
+            string score = options.SelectionMode == "QualityWeighted" ? $" · 权重 {Planner.WeightScore(id)}/100" : "";
+            lines.Add($"{id} · {name} · Steam 快照 {game?.PlaytimeMinutes ?? 0} 分钟 · 排序估算 {Planner.EffectivePlaytimeMinutes(id):F1} 分钟{score} · {Planner.Explain(id)}");
         }
         return string.Join('\n', lines);
     }
@@ -509,7 +576,7 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         return Sequence.Distinct(ids);
     }
 
-    internal const string Help = "\nSIDLE STATUS | SCAN | PREVIEW | TRACE\nSIDLE LIST <PENDING|APPROVED|PINNED|EXCLUDED|REJECTED|ALL> [页码]\nSIDLE APPROVE <ALL|AppID...>\nSIDLE REJECT|PIN|UNPIN|EXCLUDE|UNEXCLUDE|WHY <AppID...>\nSIDLE PAUSE | RESUME | ROTATE | RESTORE";
+    internal const string Help = "\nSIDLE STATUS | SCAN | PREVIEW | TRACE | RATINGS\nSIDLE LIST <PENDING|APPROVED|PINNED|EXCLUDED|REJECTED|ALL> [页码]\nSIDLE APPROVE <ALL|AppID...>\nSIDLE REJECT|PIN|UNPIN|EXCLUDE|UNEXCLUDE|WHY <AppID...>\nSIDLE WEIGHT <AppID> <1～100|AUTO>\nSIDLE PAUSE | RESUME | ROTATE | RESTORE";
 
     private void ReleaseLease() {
         if (LeasePath is { } path) {
@@ -522,6 +589,11 @@ internal sealed class BotCoordinator(Bot bot, IdleOptions options, Func<SteamSes
         await Stop.CancelAsync().ConfigureAwait(false);
         try {
             if (Worker is not null) await Worker.ConfigureAwait(false);
+            if (RatingRefresh is not null) {
+                try { await RatingRefresh.ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+                catch (Exception exception) { bot.ArchiLogger.LogGenericWarning($"SmartIdle 评分后台任务已结束：{exception.GetType().Name}"); }
+            }
             await Gate.WaitAsync().ConfigureAwait(false);
             try {
                 StopTracking();

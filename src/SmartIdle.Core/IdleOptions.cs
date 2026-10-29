@@ -6,6 +6,9 @@ public sealed record IdleOptions {
     public int RotationMinutes { get; set; } = 120;
     public int RefreshHours { get; set; }
     public string SelectionMode { get; set; } = "LeastPlaytime";
+    public int ReputationWeightPercent { get; set; } = 80;
+    public double WeightStrength { get; set; } = 1;
+    public int RatingRefreshHours { get; set; } = 168;
     public uint[] PinnedGames { get; set; } = [];
     public uint[] Blacklist { get; set; } = [];
 
@@ -20,7 +23,16 @@ public sealed record IdleOptions {
             throw new ArgumentException("RefreshHours 必须在 0～8760 之间；0 表示只在首次或手动请求时读取。");
         }
         if (!IsValidSelectionMode(SelectionMode)) {
-            throw new ArgumentException("SelectionMode 必须为 LeastPlaytime、Random 或 RoundRobin。");
+            throw new ArgumentException("SelectionMode 必须为 LeastPlaytime、Random、RoundRobin 或 QualityWeighted。");
+        }
+        if (ReputationWeightPercent is < 0 or > 100) {
+            throw new ArgumentException("ReputationWeightPercent 必须在 0～100 之间。");
+        }
+        if (!double.IsFinite(WeightStrength) || WeightStrength is < 0.25 or > 4) {
+            throw new ArgumentException("WeightStrength 必须为 0.25～4 之间的有限数字。");
+        }
+        if (RatingRefreshHours is < 1 or > 8760) {
+            throw new ArgumentException("RatingRefreshHours 必须在 1～8760 之间。");
         }
         if (PinnedGames is null || Blacklist is null) {
             throw new ArgumentException("PinnedGames 和 Blacklist 必须是非空引用，且不能包含 AppID 0。");
@@ -49,5 +61,5 @@ public sealed record IdleOptions {
         }
     }
 
-    internal static bool IsValidSelectionMode(string? mode) => mode is "LeastPlaytime" or "Random" or "RoundRobin";
+    internal static bool IsValidSelectionMode(string? mode) => mode is "LeastPlaytime" or "Random" or "RoundRobin" or "QualityWeighted";
 }

@@ -34,5 +34,7 @@ cd -- "$project_dir"
     -p:AsfReferenceDir="$reference_dir" -p:ContinuousIntegrationBuild=true
 "$dotnet_cmd" run --project tests/SmartIdle.Tests --configuration Release \
     -p:ContinuousIntegrationBuild=true
+"$dotnet_cmd" run --project tests/SmartIdle.RatingTests --configuration Release \
+    -p:ContinuousIntegrationBuild=true
 
 python3 "$script_dir/package.py"

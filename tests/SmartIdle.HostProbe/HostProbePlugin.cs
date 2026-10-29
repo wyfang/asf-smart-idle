@@ -1,4 +1,5 @@
 using System.Composition;
+using System.Net;
 using System.Text.Json;
 using ArchiSteamFarm.Plugins.Interfaces;
 using SmartIdle.Core;
@@ -220,6 +221,75 @@ public sealed class HostProbePlugin : IPlugin {
             var modeState = await IdleStateStore.LoadAsync(extraPath).ConfigureAwait(false);
             Check(modeState.LastSelectionMode == "LeastPlaytime" && modeState.EstimatedPlaytimeMinutes[1] == 3, "Mode or local credit was not persisted.");
 
+            phase = "quality-weight-config-json";
+            var qualityOptions = JsonSerializer.Deserialize<IdleOptions>(
+                "{\"Enabled\":true,\"SelectionMode\":\"QualityWeighted\",\"ConcurrentGames\":1,\"RotationMinutes\":5,\"ReputationWeightPercent\":100,\"WeightStrength\":1,\"RatingRefreshHours\":168}", IdleJson.Options)
+                ?? throw new InvalidOperationException("Quality configuration deserialized to null.");
+            qualityOptions.Validate();
+            Check(qualityOptions.SelectionMode == "QualityWeighted" && qualityOptions.ReputationWeightPercent == 100 &&
+                qualityOptions.WeightStrength == 1 && qualityOptions.RatingRefreshHours == 168, "Quality configuration lost values.");
+            Expect<ArgumentException>(() => new IdleOptions { WeightStrength = double.NaN }.Validate());
+            Expect<ArgumentException>(() => new IdleOptions { ReputationWeightPercent = 101 }.Validate());
+
+            phase = "quality-rating-service-cache";
+            var sharedRatings = GameRatingService.ForDirectory(Path.Combine(directory, "factory"));
+            Check(ReferenceEquals(sharedRatings, GameRatingService.ForDirectory(Path.Combine(directory, "factory"))),
+                "Rating service static initialization or shared factory failed.");
+            var ratingHandler = new ProbeRatingHandler();
+            using var ratingHttp = new HttpClient(ratingHandler) { Timeout = TimeSpan.FromSeconds(5) };
+            var ratingLimiter = new GameRatingService.RequestLimiter(() => DateTimeOffset.UtcNow, _ => Task.CompletedTask, TimeSpan.Zero);
+            var ratingService = new GameRatingService(directory, ratingHttp, () => DateTimeOffset.UtcNow, ratingLimiter);
+            Check(ratingService.Snapshot([620]).Count == 0, "New rating service unexpectedly had cached data.");
+            var ratingSnapshot = await ratingService.RefreshAsync([620, 620], 168, false, CancellationToken.None).ConfigureAwait(false);
+            Check(ratingSnapshot.Count == 1 && ratingSnapshot[620].PositiveReviews == 90 && ratingSnapshot[620].TotalReviews == 100,
+                "Synthetic rating response failed: " + ratingService.Status + " " + ratingService.DiagnosticFailure);
+            Check(ratingHandler.Requests == 1 && ratingService.Snapshot([620]).Count == 1, "Rating request deduplication or memory snapshot failed.");
+            string ratingCache = Path.Combine(directory, "SmartIdle-ratings", "ratings.json");
+            Check(File.Exists(ratingCache), "Rating service did not persist its synthetic cache: " + ratingService.Status);
+            var ratingReload = new GameRatingService(directory, ratingHttp, () => DateTimeOffset.UtcNow, ratingLimiter);
+            var ratingReloadSnapshot = await ratingReload.RefreshAsync([620], 168, false, CancellationToken.None).ConfigureAwait(false);
+            Check(ratingHandler.Requests == 1 && ratingReloadSnapshot.Count == 1 && ratingReloadSnapshot[620] == ratingSnapshot[620],
+                "Rating cache roundtrip queried HTTP or changed its summary: " + ratingReload.Status);
+
+            phase = "quality-weighted-active-time-and-restart";
+            var quality = new IdlePlanner(qualityOptions, new IdleState());
+            quality.RefreshLibrary([Game(1, 1000000), Game(2, 1), Game(3, 500)]);
+            quality.ApproveAll();
+            quality.SetRatings(new Dictionary<uint, GameRating> { [1] = ratingSnapshot[620] });
+            int autoScore = ratingSnapshot[620].Score(qualityOptions.ReputationWeightPercent);
+            Check(quality.WeightScore(1) == autoScore && quality.WeightScore(2) == 50, "Automatic rating or neutral fallback failed.");
+            quality.SetWeight(1, 95);
+            Check(quality.WeightScore(1) == 95 && quality.ExplainWeight(1).Contains("手动覆盖 95"), "Manual override or its explanation failed.");
+            quality.SetWeight(1, null);
+            Check(quality.WeightScore(1) == autoScore, "Removing a manual override did not restore the automatic score.");
+            quality.SetWeight(1, 90);
+            quality.SetWeight(2, 60);
+            quality.SetWeight(3, 30);
+            string qualityPath = Path.Combine(directory, "weighted-state.json");
+            for (int index = 0; index < 180; index++) {
+                quality.AccruePlaytime(quality.CurrentOrSelectBatch(), 300);
+                quality.Rotate();
+                if (index == 89) {
+                    uint[] weightedBatch = Copy(quality.CurrentOrSelectBatch());
+                    double firstAllocation = quality.State.PluginAllocatedMinutes[1];
+                    await IdleStateStore.SaveAsync(qualityPath, quality.State).ConfigureAwait(false);
+                    var weightedState = await IdleStateStore.LoadAsync(qualityPath).ConfigureAwait(false);
+                    weightedState.Validate();
+                    quality = new IdlePlanner(qualityOptions, weightedState);
+                    Sequence(weightedBatch, quality.CurrentOrSelectBatch());
+                    Check(quality.WeightScore(1) == 90 && quality.WeightScore(2) == 60 && quality.WeightScore(3) == 30 &&
+                        quality.State.PluginAllocatedMinutes[1] == firstAllocation && quality.State.QualityDeficitSeconds.Count == 3,
+                        "Weighted restart lost manual scores, allocation or fairness credit.");
+                }
+            }
+            quality.ValidateState();
+            Check(Math.Abs(quality.State.PluginAllocatedMinutes[1] - 450) <= 5 &&
+                Math.Abs(quality.State.PluginAllocatedMinutes[2] - 300) <= 5 &&
+                Math.Abs(quality.State.PluginAllocatedMinutes[3] - 150) <= 5,
+                "90:60:30 did not allocate active minutes close to 3:2:1 across a restart.");
+            Check(quality.State.QualityAutomaticScores[1] == autoScore && quality.ExplainWeight(1).Contains("最终分 90/100"),
+                "Weighted automatic snapshot or explanation was lost after restart.");
+
             phase = "cancelled-save-retains-state";
             string beforeCancellation = await File.ReadAllTextAsync(statePath).ConfigureAwait(false);
             using (var cancelled = new CancellationTokenSource()) {
@@ -276,6 +346,19 @@ public sealed class HostProbePlugin : IPlugin {
     private static JsonElement JsonField(JsonElement root, string name) {
         foreach (var property in root.EnumerateObject()) if (property.Name == name) return property.Value;
         throw new InvalidOperationException("Missing synthetic field: " + name);
+    }
+
+    // Every HTTP call from the rating probe is answered in memory. Never use a real network handler.
+    private sealed class ProbeRatingHandler : HttpMessageHandler {
+        internal int Requests;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) {
+            Check(request.RequestUri is not null && request.RequestUri.Host == "api.steampowered.com" &&
+                request.RequestUri.AbsolutePath == "/IUserReviewsService/GetAppReviews/v1/", "Unexpected rating request URI.");
+            Requests++;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent("{\"response\":{\"query_summary\":{\"total_positive\":90,\"total_negative\":10,\"total_reviews\":100}}}")
+            });
+        }
     }
 
     private sealed class ProbeNetworkListener : IDebugNetworkListener {
